@@ -283,12 +283,12 @@ test("new machine automatically offers repository conversations and restores act
     f.controller.dispose();
     const store = new ArchiveStore(path.join(f.root, "recipient-store"), f.config, { localTest: true });
     let lists = 0, selects = 0, inputs = 0;
-    const recipientRoot = path.join(f.root, "machine-b"), destination = path.join(f.root, "restored-on-b");
+    const recipientRoot = path.join(f.root, "machine-b");
     const recipient = new ArchiveController({ ...f.session, sessionId: "new-machine-session",
         capabilities: { ui: { elicitation: true } },
         ui: {
             select: async (_message, choices) => { selects++; assert.match(choices[0], /Generate a blue sales report/); return choices[0]; },
-            input: async (message) => { inputs++; assert.match(message, /local restore folder/); return destination; },
+            input: async () => { inputs++; assert.fail("Startup selection must choose a restore folder automatically."); },
         },
     }, { ...f.options, root: recipientRoot, config: undefined,
         verifyDestination: async (config) => { assert.equal(config.destination.repo, f.repository.repo); assert.equal(config.destination.branch, "main"); },
@@ -296,11 +296,13 @@ test("new machine automatically offers repository conversations and restores act
     t.after(() => recipient.dispose());
     await recipient.initialize("new");
     assert.equal(selects, 1);
-    assert.equal(inputs, 1, "Only the safe local restore folder is requested, never archive configuration.");
+    assert.equal(inputs, 0, "Conversation selection is the only question.");
     assert.equal(lists, 1);
     await assert.rejects(fs.access(path.join(recipientRoot, "config.json")));
     await assert.rejects(fs.access(path.join(recipientRoot, "pending")));
     const restored = recipient.imported;
+    const destination = restored.directory;
+    assert.equal(path.dirname(destination), path.join(recipientRoot, "restored"));
     assert.equal(restored.manifest.eventCount, 2);
     const history = await fs.readFile(path.join(destination, "history.jsonl"), "utf8");
     assert.match(history, /Generate a blue sales report/);
@@ -328,6 +330,7 @@ test("startup picker cancellation, fresh choice and empty archives never import 
         assert.equal(selects, mode === "empty" ? 0 : 1);
         assert.equal(imports, 0);
         assert.equal(f.controller.imported, null);
+        await assert.rejects(fs.access(path.join(f.state, "restored")));
         await assert.rejects(fs.access(path.join(f.state, "pending")));
         await f.controller.initialize("startup");
         assert.equal(selects, mode === "empty" ? 0 : 1);

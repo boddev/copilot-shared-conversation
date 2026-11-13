@@ -422,13 +422,14 @@ test("archive-load restores recorded legacy history and artifacts when main cont
     const mock = mockSession("new-recipient");
     let selects = 0;
     mock.session.ui.select = async (_message, choices) => { selects++; assert.match(choices[0], /archive/); return choices[0]; };
-    const restored = path.join(root, "restored");
-    mock.session.ui.input = async () => restored;
+    mock.session.ui.input = async () => assert.fail("Selecting a conversation must not ask for a restore folder.");
     const controller = new ArchiveController(mock.session, { root: path.join(root, "recipient"), config, localTest: true, store });
     await controller.runCommand({ commandName: "archive-load" });
     assert.equal(selects, 1);
     assert.equal(mock.state.reads, 0, "Loading must not export the new recipient conversation.");
     assert.ok(!mock.state.logs.some((entry) => entry.level === "error"));
+    const restored = controller.imported.directory;
+    assert.equal(path.dirname(restored), path.join(root, "recipient", "restored"));
     assert.equal(hash(await fs.readFile(path.join(restored, "history.jsonl"))), hash(capture.files.get("history.jsonl")));
     assert.match(await fs.readFile(path.join(restored, "transcript.md"), "utf8"), /60 \/ 3 = 20/);
     const archivedArtifact = controller.imported.manifest.artifacts[0];
@@ -437,6 +438,55 @@ test("archive-load restores recorded legacy history and artifacts when main cont
     assert.equal((await command("git", ["ls-remote", "--heads", remote])).stdout, before, "Loading must not move or rewrite either branch.");
     const standalone = await store.import(key, path.join(root, "standalone-restored"));
     assert.equal(standalone.manifest.eventCount, capture.manifest.eventCount);
+});
+
+test("one conversation selection loads the current latest revision into a unique managed folder without further questions", async (t) => {
+    const { root, remote, config } = await localRemote(t);
+    const store = new ArchiveStore(path.join(root, "store"), config, { localTest: true });
+    const key = sessionKey("latest-without-questions");
+    const events = [{ id: "request", type: "user.message", data: { content: "Synthetic versioned report" } }];
+    const first = await snapshot("latest-without-questions", events, []);
+    await store.publish(key, first);
+    events.push({ id: "second", type: "assistant.message", data: { content: "Second saved revision" } });
+    const second = await snapshot("latest-without-questions", events, []);
+    await store.publish(key, second);
+    assert.equal((await store.list())[0].checkpoints.length, 2);
+    const report = path.join(root, "latest-report.bin"), bytes = Buffer.from([0, 255, 42, 128]);
+    await fs.writeFile(report, bytes);
+    events.push({ id: "latest", type: "assistant.message", data: { content: "Newest saved revision and binary report" } });
+    const latest = await snapshot("latest-without-questions", events, [await artifactApproval(report)]);
+    const mock = mockSession("latest-recipient");
+    let selects = 0, refs;
+    mock.session.ui.select = async (_message, choices) => {
+        selects++;
+        if (selects === 1) {
+            // Advance the pointer after listing, before the human finishes selecting.
+            await store.publish(key, latest);
+            refs = (await command("git", ["ls-remote", "--heads", remote])).stdout;
+        }
+        return choices[0];
+    };
+    mock.session.ui.input = async () => assert.fail("No restore-folder question.");
+    mock.session.ui.confirm = async () => assert.fail("No extra confirmation.");
+    const controller = new ArchiveController(mock.session, { root: path.join(root, "recipient"), config, localTest: true, store });
+    await controller.runCommand({ commandName: "archive-load" });
+    assert.equal(selects, 1, "Only the conversation is selected, never a checkpoint.");
+    assert.ok(!mock.state.logs.some(entry => entry.level === "error"));
+    const imported = controller.imported;
+    assert.equal(path.dirname(imported.directory), path.join(controller.root, "restored"));
+    assert.deepEqual(await fs.readFile(path.join(imported.directory, "history.jsonl")), latest.files.get("history.jsonl"));
+    const artifact = imported.manifest.artifacts[0];
+    assert.equal(hash(await fs.readFile(path.join(imported.directory, ...artifact.file.split("/")))), hash(bytes));
+    assert.equal((await controller.search("Newest saved revision")).matches.length, 1);
+    await fs.writeFile(path.join(imported.directory, "keep-local-edit.txt"), "Do not overwrite this restored copy.");
+    await controller.runCommand({ commandName: "archive-load" });
+    assert.equal(selects, 2);
+    assert.notEqual(controller.imported.directory, imported.directory);
+    assert.equal(await fs.readFile(path.join(imported.directory, "keep-local-edit.txt"), "utf8"), "Do not overwrite this restored copy.");
+    assert.deepEqual(await fs.readFile(path.join(controller.imported.directory, "history.jsonl")), latest.files.get("history.jsonl"));
+    assert.equal((await command("git", ["ls-remote", "--heads", remote])).stdout, refs);
+    assert.equal(mock.state.reads, 0);
+    assert.ok(!mock.state.logs.some(entry => entry.level === "error"));
 });
 
 test("publishing alongside repository files preserves their bytes and disables Git attributes/filters", async (t) => {

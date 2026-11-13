@@ -55,7 +55,6 @@ try {
         destination: { repo: "synthetic-owner/synthetic-archive", remote: "https://github.com/synthetic-owner/synthetic-archive.git" } });
     const requests = [];
     let loadRequested = false;
-    const restoredDirectory = path.join(root, "restored-from-archive-load");
     const options = {
         workingDirectory: root, requestExtensions: true, pluginDirectories: [plugin],
         onPermissionRequest: permissionHandler,
@@ -64,7 +63,6 @@ try {
             if (!loadRequested) return { action: "decline" };
             const fields = request.requestedSchema?.properties;
             if (fields?.selection?.enum) return { action: "accept", content: { selection: fields.selection.enum[0] } };
-            if (fields?.value?.type === "string") return { action: "accept", content: { value: restoredDirectory } };
             throw new Error("Unexpected synthetic archive-load elicitation schema.");
         },
     };
@@ -105,6 +103,10 @@ try {
     const capture = await snapshot("previous-synthetic", [
         { id: "synthetic-request", type: "user.message", data: { content: "Synthetic previous conversation for startup picker" } },
     ], [await artifactApproval(report)]);
+    const previous = await snapshot("previous-synthetic", [
+        { id: "synthetic-request", type: "user.message", data: { content: "Synthetic previous conversation for startup picker" } },
+    ], []);
+    await legacy.publish(sessionKey("previous-synthetic"), previous);
     await legacy.publish(sessionKey("previous-synthetic"), capture);
     const seed = path.join(root, "main-documents");
     await fs.mkdir(path.join(seed, "conversations"), { recursive: true });
@@ -150,8 +152,12 @@ await startExtension(joinSession, {
     loadRequested = true;
     const loaded = await session.rpc.commands.execute({ commandName: "archive-load", args: "" });
     assert.equal(loaded.error, undefined);
-    assert.equal(requests.length, 3, "Explicit archive-load must ask only for a saved conversation and a local restore folder.");
+    assert.equal(requests.length, 2, "Explicit archive-load must ask only for a conversation, never a checkpoint or restore folder.");
     assert.match(JSON.stringify(requests[1]), /archive/);
+    const restoreRoot = path.join(root, "archive", "restored");
+    const restoredFolders = await fs.readdir(restoreRoot);
+    assert.equal(restoredFolders.length, 1);
+    const restoredDirectory = path.join(restoreRoot, restoredFolders[0]);
     assert.deepEqual(await fs.readFile(path.join(restoredDirectory, "history.jsonl")), capture.files.get("history.jsonl"));
     const manifest = await readJson(path.join(restoredDirectory, "manifest.json"));
     assert.equal(hash(await fs.readFile(path.join(restoredDirectory, ...manifest.artifacts[0].file.split("/")))), hash(reportBytes));
@@ -162,6 +168,7 @@ await startExtension(joinSession, {
         automaticStartupConsentRequests: 0, automaticConversationPickerRequests: 1,
         syntheticPickerDeclined: true, resumedWithoutRepeatedPicker: true, syntheticPrivateSessionActivated: true,
         archiveLoadCommandExecuted: true, mixedMainDocumentsAndLegacyArchive: true,
+        latestCheckpointAutomatic: true, restoreDirectoryAutomatic: true,
         actualHistoryAndArtifactHashesVerified: true, remoteBranchesUnchanged: true,
         externalVisibilityAndStorage: "synthetic local fixtures", modelPromptsSent: 0, githubUploads: 0 }));
 } catch (error) {

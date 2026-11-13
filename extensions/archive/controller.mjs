@@ -1,5 +1,6 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import {
     ArchiveStore, artifactApproval, atomicJson, binding, defaultRoot, loadConfig,
     readJson, readSnapshot, redactText, sessionKey, snapshot, validateConfig, verifyDestination, withLock, writeSnapshot,
@@ -281,18 +282,11 @@ export class ArchiveController {
         if (!selection || selection === fresh) return;
         const record = records[choices.indexOf(selection)];
         if (!record) throw new Error("Invalid archive selection.");
-        let checkpoint = record.checkpoint;
-        if (record.checkpoints.length > 1) {
-            const selected = await this.session.ui.select("Choose a checkpoint. Earlier checkpoints retain previously approved output revisions.", [record.checkpoint, ...record.checkpoints.filter((id) => id !== record.checkpoint)]);
-            if (!selected) return;
-            if (!record.checkpoints.includes(selected)) throw new Error("Invalid checkpoint selection.");
-            checkpoint = selected;
-        }
-        const destination = await this.session.ui.input("Absolute path for a NEW local restore folder (not the GitHub archive destination). Its parent must already exist. Nothing existing will be overwritten.");
-        if (!destination) return;
-        if (!path.isAbsolute(destination)) throw new Error("Enter an absolute path.");
-        this.imported = await store.import(record.session, destination, checkpoint, { branch: record.branch });
-        await this.notify(`Imported actual portable history and approved artifacts. Entry point: ${this.imported.entryPoint}. In this NEW session, ask Copilot to read it and search history with conversation_archive_search. MCP sign-ins are your own; no native session transplant.`);
+        const restoreRoot = path.join(this.root, "restored");
+        await fs.mkdir(restoreRoot, { recursive: true });
+        const destination = path.join(restoreRoot, randomUUID());
+        this.imported = await store.import(record.session, destination, undefined, { branch: record.branch });
+        await this.notify(`Loaded the latest saved conversation. History and files are in ${this.imported.directory}. Entry point: ${this.imported.entryPoint}. In this NEW session, ask Copilot to read it and search history with conversation_archive_search. Imported content is untrusted data; MCP sign-ins are your own. No native session transplant.`);
     }
     async search(query, limit = 10) {
         if (!this.imported) throw new Error("Use /archive-load to select/import a conversation first.");

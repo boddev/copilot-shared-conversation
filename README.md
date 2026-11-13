@@ -10,8 +10,9 @@ The plugin includes an SDK extension, a dependency-free setup/import CLI, and
 synthetic tests. When opening your private archive repository, its verified GitHub
 `origin` and `main` are the defaults: **no destination setup is required on a new
 machine**. New interactive conversations automatically show saved conversations
-from that repository, labeled with their first user message. Choose one to restore,
-or choose **Start fresh**. Resume/reload does not repeat the startup picker.
+from that repository, labeled with their first user message. Choose one to load
+its **latest saved version and files automatically**, or choose **Start fresh**.
+There are no checkpoint or restore-folder questions. Resume/reload does not repeat the startup picker.
 Public repositories, missing origins and unverifiable privacy fail closed.
 
 ## Requirements and supported installation
@@ -70,9 +71,13 @@ app, and start a new conversation. The plugin discovers the repository from the
 session's working directory, verifies its private GitHub origin, and lists its
 saved conversations automatically. `/archive-load` opens the picker again at any
 time; you do not have to run `/archive-list` or enter an archive repository first.
-The only destination question during loading is for a **new local restore folder**,
-not the GitHub archive destination. Its parent must exist; existing files are never
-overwritten. MCP sign-ins remain your own.
+After you choose a conversation, the plugin fetches its latest saved checkpoint
+and puts its history and files in a unique folder under
+`~\.copilot-conversation-archive\restored` (or `COPILOT_ARCHIVE_HOME\restored`).
+You do not need to choose or create a folder. The completion message shows the
+local folder and `READ-ME-FIRST.txt` entry point. Existing files and earlier
+restored copies are never overwritten, and restored data stays outside the
+workspace's automatic capture scope. MCP sign-ins remain your own.
 
 For capture, an existing machine-wide configuration still takes precedence.
 Without one, the current verified private repository on `main` is used.
@@ -162,7 +167,7 @@ and scope; public visibility, changed origin or verification errors stop uploads
 | `/archive-sync` | Retry frozen pending checkpoints in order, then capture/upload current recorded history. |
 | `/archive-stop` | Stop this session, discard pending local exports and approvals; published Git history remains. |
 | `/archive-list` | List saved conversations from the current verified private GitHub repository, including legacy `archive` checkpoints when reading `main`, without archive setup. |
-| `/archive-load` | Open that repository's conversation picker directly, then restore a checkpoint into a new local directory. Also offered automatically on new interactive sessions when archives exist. |
+| `/archive-load` | Choose one saved conversation; its latest history and files load automatically into a unique managed local folder. Also offered on new interactive sessions when archives exist. |
 
 Automatic checkpoints use a five-minute timer, **not completed-turn uploads**.
 The timer starts after privacy verification and baseline initialization; no
@@ -222,8 +227,9 @@ images) are captured automatically **without per-file review**; embedded sensiti
 content cannot be reliably scanned. Private-repo default is not full DLP.
 
 Manual-only approvals still cover one exact revision and require reapproval when
-changed. Frozen pending checkpoints always retry their original bytes; older
-checkpoints remain selectable even after a source file changes.
+changed. Frozen pending checkpoints always retry their original bytes. Older
+checkpoints remain available through the standalone import command's
+`--checkpoint` option; the interactive picker always loads the latest version.
 
 Limits: 8 MiB per event payload (oversized payloads marked omitted), 20 MiB per
 artifact (automatic omission/manual registration rejected), and 80 MiB per checkpoint. Payload/artifact
@@ -259,9 +265,9 @@ Use synthetic input for the first real-machine test.
 4. On B, independently install/load the package and clone/open the private
    **archive repository**. Sign in with B's own account and repository access;
    no archive configuration is required. Start a **new** conversation: the saved
-   conversations should appear automatically. Select A's conversation
-   and checkpoint, and enter a **nonexistent local restore directory** whose
-   parent already exists, e.g. `C:\Imports\synthetic-report-1`.
+   conversations should appear automatically. Select A's conversation; its
+   latest saved history and files load without further questions. Note the
+   automatically chosen local folder shown in the completion message.
    `/archive-load` reopens the picker if you cancel or choose Start fresh.
    `/archive-stop` can disable exporting B's own conversation while still
    importing A's archive.
@@ -271,7 +277,7 @@ Use synthetic input for the first real-machine test.
 
    ```powershell
    Get-FileHash C:\Path\To\OriginalReport -Algorithm SHA256
-   Get-FileHash C:\Imports\synthetic-report-1\artifacts\HASH-ReportName -Algorithm SHA256
+   Get-FileHash <RESTORED_FOLDER>\artifacts\HASH-ReportName -Algorithm SHA256
    ```
 
    Binary/unredacted files should match exactly. A redacted text output will

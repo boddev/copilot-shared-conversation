@@ -1,6 +1,6 @@
 {
   "name": "conversation-archive",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Automatic private-repository conversation and output sharing with asynchronous five-minute sync.",
   "extensions": ["extensions/"]
 }

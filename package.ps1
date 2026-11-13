@@ -22,7 +22,7 @@ $files = @(
     'test\automatic.test.mjs',
     'test\runtime-smoke.mjs'
 )
-$zip = Join-Path $output 'conversation-archive-0.2.3.zip'
+$zip = Join-Path $output 'conversation-archive-0.2.4.zip'
 if (Test-Path -LiteralPath $zip) { throw "Refusing to overwrite existing package: $zip" }
 try {
     foreach ($file in $files) {
