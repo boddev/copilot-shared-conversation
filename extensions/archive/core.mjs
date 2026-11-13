@@ -29,6 +29,7 @@ export async function command(executable, args, cwd) {
 }
 const branchName = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 export function validateConfig(config, { localTest = false } = {}) {
+    config = { ...config, destination: { ...config.destination, branch: config.destination?.branch ?? "main" } };
     if (config.version !== 1 || !branchName.test(config.destination?.branch || "")) throw new Error("Invalid archive configuration.");
     const d = config.destination;
     if (localTest && d.localTest === true && path.isAbsolute(d.remote)) return config;
@@ -262,8 +263,8 @@ export class ArchiveStore {
                 await this.git(directory, ["fetch", "--quiet", "origin", ref]);
                 const tree = await this.git(directory, ["ls-tree", "-r", "--name-only", "FETCH_HEAD"]);
                 for (const file of tree.stdout.trim().split("\n").filter(Boolean)) {
-                    if (!/^conversations\/[a-f0-9]{64}\/(?:latest\.json|checkpoints\/[a-f0-9]{64}\/(?:manifest\.json|READ-ME-FIRST\.txt|history\.jsonl|transcript\.md|(?:blobs|artifacts)\/[A-Za-z0-9_.-]+))$/.test(file) || file.includes("..")) {
-                        throw new Error("Archive branch contains unexpected paths. Use a dedicated blank repository/branch.");
+                    if ((file !== "README.md" && !/^conversations\/[a-f0-9]{64}\/(?:latest\.json|checkpoints\/[a-f0-9]{64}\/(?:manifest\.json|READ-ME-FIRST\.txt|history\.jsonl|transcript\.md|(?:blobs|artifacts)\/[A-Za-z0-9_.-]+))$/.test(file)) || file.includes("..")) {
+                        throw new Error("Archive branch contains unexpected paths. Use a dedicated archive repository (an initial README.md is supported).");
                     }
                 }
                 await this.git(directory, ["checkout", "--quiet", "-b", "archive-work", "FETCH_HEAD"]);

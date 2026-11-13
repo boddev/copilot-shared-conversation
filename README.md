@@ -62,10 +62,12 @@ extension from loading; the plugin never bypasses host trust or managed policy.
 
 ## Configure each machine
 
-Use an existing **blank, private** GitHub repository chosen by you, not this
+Use an existing **private archive** GitHub repository chosen by you, not this
 configuration repository. The plugin neither creates a repository nor accepts
-public targets. The archive uses a dedicated `archive` branch, including the
-first commit to an empty repository.
+public targets. Conversations commit directly to **`main`** by default, including
+the first commit to an empty repository. A repository initialized with `README.md`
+is supported: its README and existing commits are preserved. No per-conversation
+remote branches or separate `archive` branch are created.
 
 ```powershell
 gh auth login
@@ -77,6 +79,15 @@ Replace `OWNER/REPO` with your predetermined archive. Setup verifies PRIVATE
 visibility with `gh repo view`, writes only destination configuration, and
 does not inspect conversation history or upload anything. Git uses your normal
 credential helper. No credentials are stored by this package.
+
+Existing installations configured for `archive` should rerun the configure
+command above once (without `--branch`) to select `main` for new conversations.
+Saved history on the old branch is not moved, deleted or overwritten. Existing
+sessions with an old destination binding fail closed rather than silently
+redirecting pending checkpoints; start a new conversation after switching.
+An explicit `--branch NAME` override remains available if you intentionally
+want a different archive destination. Changing this setting affects only the
+archive repository, not your working repository's checked-out branch.
 
 State lives separately in `~\.copilot-conversation-archive`, not in a working
 repository or this plugin package. For a different location, set
@@ -247,7 +258,8 @@ Publication checks private visibility each time, uses non-force push, and
 retries by fetching the current branch and reapplying this checkpoint.
 Different-session writers coexist. Same-conversation divergence, changed
 previous history or shrinking history fails explicitly rather than overwriting.
-The archive branch admits only its own checkpoint paths, not arbitrary
+The archive destination admits only its own checkpoint paths and an initial
+`README.md`, not arbitrary
 configuration, hooks or Git attribute files.
 
 Frozen pending checkpoints are bound to persisted consent/scope and survive reload.

@@ -314,3 +314,51 @@ test("background timer replaces completed-turn uploads and skips unapproved sess
         controller.dispose();
     }
 });
+
+test("default main publishes conversations without extra remote branches and preserves an existing README", async (t) => {
+    const { root, remote } = await localRemote(t);
+    const seed = path.join(root, "seed");
+    await fs.mkdir(seed);
+    await command("git", ["init", "--quiet", "--initial-branch=main"], seed);
+    const readme = "Private archive repository initialized with a README.\n";
+    await fs.writeFile(path.join(seed, "README.md"), readme);
+    await command("git", ["add", "README.md"], seed);
+    await command("git", ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@localhost", "-c", "commit.gpgsign=false",
+        "commit", "--quiet", "-m", "Initialize synthetic archive"], seed);
+    const original = (await command("git", ["rev-parse", "HEAD"], seed)).stdout.trim();
+    await command("git", ["push", "--quiet", remote, "main"], seed);
+    const config = { version: 1, destination: { remote, localTest: true } };
+    const a = new ArchiveStore(path.join(root, "A"), config, { localTest: true });
+    const b = new ArchiveStore(path.join(root, "B"), config, { localTest: true });
+    const first = await snapshot("main-first", fixtureEvents(), []);
+    const second = await snapshot("main-second", fixtureEvents(), []);
+    a.beforePush = async (attempt) => { if (!attempt) await b.publish(sessionKey("main-second"), second); };
+    const published = await a.publish(sessionKey("main-first"), first);
+    assert.equal(published.attempts, 2);
+    const refs = (await command("git", ["ls-remote", "--heads", remote])).stdout.trim().split("\n");
+    assert.equal(refs.length, 1);
+    assert.ok(refs[0].endsWith("refs/heads/main"));
+    assert.equal((await a.list()).length, 2);
+    const actualReadme = await command("git", ["--git-dir", remote, "show", "main:README.md"]);
+    assert.equal(actualReadme.stdout, readme);
+    await command("git", ["--git-dir", remote, "merge-base", "--is-ancestor", original, "main"]);
+    const imported = await b.import(sessionKey("main-first"), path.join(root, "main-restored"));
+    assert.deepEqual(await fs.readFile(path.join(imported.directory, "history.jsonl")), first.files.get("history.jsonl"));
+});
+
+test("main is the first branch in an empty archive unless a destination branch is explicitly configured", async (t) => {
+    const { root, remote } = await localRemote(t);
+    const config = { version: 1, destination: { remote, localTest: true } };
+    const store = new ArchiveStore(path.join(root, "writer"), config, { localTest: true });
+    await store.publish(sessionKey("empty-main"), await snapshot("empty-main", fixtureEvents(), []));
+    const refs = (await command("git", ["ls-remote", "--heads", remote])).stdout;
+    assert.match(refs, /refs\/heads\/main/);
+    assert.ok(!refs.includes("refs/heads/archive"));
+    const legacy = new ArchiveStore(path.join(root, "legacy"), fakeConfig(remote), { localTest: true });
+    await legacy.publish(sessionKey("explicit-archive"), await snapshot("explicit-archive", fixtureEvents(), []));
+    const branches = (await command("git", ["ls-remote", "--heads", remote])).stdout;
+    assert.match(branches, /refs\/heads\/main/);
+    assert.match(branches, /refs\/heads\/archive/);
+    assert.equal((await store.list()).length, 1);
+    assert.equal((await legacy.list()).length, 1);
+});

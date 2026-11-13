@@ -52,7 +52,7 @@ try {
     await session.disconnect();
 
     await atomicJson(path.join(root, "archive", "config.json"), { version: 1,
-        destination: { repo: "synthetic-owner/synthetic-archive", remote: "https://github.com/synthetic-owner/synthetic-archive.git", branch: "archive" } });
+        destination: { repo: "synthetic-owner/synthetic-archive", remote: "https://github.com/synthetic-owner/synthetic-archive.git" } });
     const requests = [];
     const options = {
         workingDirectory: root, requestExtensions: true, pluginDirectories: [plugin],
@@ -90,7 +90,7 @@ try {
         await command("git", ["remote", "add", "origin", `https://github.com/${privateRepo}.git`], workingDirectory);
         await fs.writeFile(path.join(workingDirectory, "existing-synthetic.txt"), "Existing synthetic file must only be fingerprinted.");
         await atomicJson(path.join(root, "archive", "config.json"), { version: 1,
-            destination: { repo: privateRepo, remote: `https://github.com/${privateRepo}.git`, branch: "archive" } });
+            destination: { repo: privateRepo, remote: `https://github.com/${privateRepo}.git` } });
         session = await client.createSession({ ...options, workingDirectory });
         await ready(session);
         const statePath = path.join(root, "archive", "consent", `${sessionKey(session.sessionId)}.json`);

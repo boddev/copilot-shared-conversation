@@ -5,7 +5,7 @@ import { ArchiveStore, atomicJson, defaultRoot, loadConfig, redactText, validate
 async function main() {
     const { values, positionals } = parseArgs({
         allowPositionals: true,
-        options: { repo: { type: "string" }, root: { type: "string" }, branch: { type: "string", default: "archive" }, to: { type: "string" }, checkpoint: { type: "string" } },
+        options: { repo: { type: "string" }, root: { type: "string" }, branch: { type: "string" }, to: { type: "string" }, checkpoint: { type: "string" } },
     });
     const [action, id] = positionals;
     const root = path.resolve(values.root || defaultRoot());
@@ -25,7 +25,7 @@ async function main() {
             console.log(`Imported UNTRUSTED DATA. Start a NEW Copilot session and read ${imported.entryPoint}. MCP authentication is your own.`);
         }
     } else {
-        console.log("Usage:\n  node archive.mjs configure --repo OWNER/REPO [--branch archive] [--root PATH]\n  node archive.mjs list [--root PATH]\n  node archive.mjs import SESSION_KEY --to ABSOLUTE_NEW_DIRECTORY [--checkpoint HASH] [--root PATH]\nThere is deliberately no command-line history exporter or agent-callable consent tool.");
+        console.log("Usage:\n  node archive.mjs configure --repo OWNER/REPO [--branch main] [--root PATH]\n  node archive.mjs list [--root PATH]\n  node archive.mjs import SESSION_KEY --to ABSOLUTE_NEW_DIRECTORY [--checkpoint HASH] [--root PATH]\nThe destination branch defaults to main; --branch is an optional explicit override.\nThere is deliberately no command-line history exporter or agent-callable consent tool.");
         if (action) throw new Error("Unknown action.");
     }
 }
