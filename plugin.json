@@ -1,6 +1,6 @@
 {
   "name": "conversation-archive",
-  "version": "0.1.0",
-  "description": "Opt-in portable conversation history and individually approved artifacts in a private GitHub archive.",
+  "version": "0.2.0",
+  "description": "Automatic private-repository conversation and output sharing with asynchronous five-minute sync.",
   "extensions": ["extensions/"]
 }

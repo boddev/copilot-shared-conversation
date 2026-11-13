@@ -3,9 +3,9 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { atomicJson, readJson, redactText, sessionKey } from "../extensions/archive/core.mjs";
+import { atomicJson, command, readJson, redactText, sessionKey } from "../extensions/archive/core.mjs";
 
-const [sdkDirectory, cliLoader] = process.argv.slice(2);
+const [sdkDirectory, cliLoader, privateRepo] = process.argv.slice(2);
 if (!sdkDirectory || !cliLoader) throw new Error("Usage: node test/runtime-smoke.mjs ABSOLUTE_SDK_DIRECTORY ABSOLUTE_CLI_NPM_LOADER");
 const { CopilotClient, RuntimeConnection } = await import(pathToFileURL(path.join(sdkDirectory, "index.js")));
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "archive-runtime-smoke-"));
@@ -64,23 +64,53 @@ try {
     assert.equal(session.capabilities.ui?.elicitation, true);
     const statePath = path.join(root, "archive", "consent", `${sessionKey(session.sessionId)}.json`);
     const deadline = Date.now() + 5000;
-    while (!(await readJson(statePath, null)) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(requests.length, 1, "Expected exactly one automatic startup consent request.");
-    assert.match(requests[0].message, /Save this conversation's recorded/);
-    assert.match(requests[0].message, /synthetic-owner\/synthetic-archive/);
-    assert.equal((await readJson(statePath)).accepted, false);
+    let configuredEvents = await session.getEvents();
+    while (!JSON.stringify(configuredEvents).includes("Startup failed closed") && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        configuredEvents = await session.getEvents();
+    }
+    assert.ok(JSON.stringify(configuredEvents).includes("Startup failed closed"), "Non-repository workspace must fail closed.");
+    assert.equal(requests.length, 0, "Startup must not ask for per-conversation consent.");
+    assert.equal(await readJson(statePath, null), null);
     await assert.rejects(fs.access(path.join(root, "archive", "pending")));
     const id = session.sessionId;
     await session.disconnect();
     session = await client.resumeSession(id, options);
     await session.rpc.extensions.reload();
     await ready(session);
-    assert.equal(requests.length, 1, "Resume/reload must not prompt after a saved decline.");
+    assert.equal(requests.length, 0, "Resume/reload must not prompt.");
     await assert.rejects(fs.access(path.join(root, "archive", "pending")));
+    let privateSessionActivated = false;
+    if (privateRepo) {
+        if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(privateRepo)) throw new Error("Optional private repository must be owner/repo.");
+        await session.disconnect();
+        const workingDirectory = path.join(root, "synthetic-private-work");
+        await fs.mkdir(workingDirectory);
+        await command("git", ["init", "--quiet"], workingDirectory);
+        await command("git", ["remote", "add", "origin", `https://github.com/${privateRepo}.git`], workingDirectory);
+        await fs.writeFile(path.join(workingDirectory, "existing-synthetic.txt"), "Existing synthetic file must only be fingerprinted.");
+        await atomicJson(path.join(root, "archive", "config.json"), { version: 1,
+            destination: { repo: privateRepo, remote: `https://github.com/${privateRepo}.git`, branch: "archive" } });
+        session = await client.createSession({ ...options, workingDirectory });
+        await ready(session);
+        const statePath = path.join(root, "archive", "consent", `${sessionKey(session.sessionId)}.json`);
+        const deadline = Date.now() + 15000;
+        let state = await readJson(statePath, null);
+        while (!state && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            state = await readJson(statePath, null);
+        }
+        assert.ok(state?.accepted && state.automatic, "Real runtime must automatically activate a new verified-private session.");
+        assert.equal(state.repository.toLowerCase(), privateRepo.toLowerCase());
+        assert.ok(Object.keys(state.baseline).some((file) => file.endsWith("existing-synthetic.txt")));
+        assert.equal(requests.length, 0);
+        await assert.rejects(fs.access(path.join(root, "archive", "pending")));
+        privateSessionActivated = true;
+    }
     console.log(JSON.stringify({ sdk: sdkDirectory, runtimeVersion: events.find((e) => e.type === "session.start")?.data.copilotVersion,
         pluginLoaded: true, extension: archive.name, status: archive.status, failClosedWithoutSetup: true,
-        automaticStartupConsentRequests: requests.length, syntheticHumanDecision: "decline",
-        resumedWithoutRepeatPrompt: true, modelPromptsSent: 0, uploads: 0 }));
+        automaticStartupConsentRequests: requests.length, unverifiedWorkspaceDisabled: true,
+        resumedWithoutPrompt: true, privateSessionActivated, modelPromptsSent: 0, uploads: 0 }));
 } catch (error) {
     if (session) {
         console.error(redactText(JSON.stringify(await session.getEvents())));

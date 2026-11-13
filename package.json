@@ -1,11 +1,11 @@
 {
   "name": "copilot-conversation-archive",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --check archive.mjs && node --check extensions/archive/extension.mjs && node --check extensions/archive/core.mjs && node --check extensions/archive/controller.mjs"
+    "check": "node --check archive.mjs && node --check extensions/archive/extension.mjs && node --check extensions/archive/core.mjs && node --check extensions/archive/controller.mjs && node --check extensions/archive/automatic.mjs"
   }
 }

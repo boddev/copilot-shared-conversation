@@ -2,11 +2,14 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import {
     ArchiveStore, artifactApproval, atomicJson, binding, defaultRoot, loadConfig,
-    readJson, readSnapshot, redactText, sessionKey, snapshot, withLock, writeSnapshot,
+    readJson, readSnapshot, redactText, sessionKey, snapshot, verifyDestination, withLock, writeSnapshot,
 } from "./core.mjs";
+import { AUTO_POLICY, changedOutputs, outputRoots, scanOutputs, scopeBinding, SYNC_INTERVAL, workingRepository } from "./automatic.mjs";
 
 export class ArchiveController {
-    constructor(session, { root = defaultRoot(), config, localTest = false, store } = {}) {
+    constructor(session, { root = defaultRoot(), config, localTest = false, store,
+        workingDirectory = process.cwd(), resolveRepository = workingRepository,
+        setInterval: schedule = globalThis.setInterval, clearInterval: unschedule = globalThis.clearInterval } = {}) {
         this.session = session;
         this.root = path.resolve(root);
         this.configOverride = config;
@@ -15,6 +18,12 @@ export class ArchiveController {
         this.queue = Promise.resolve();
         this.imported = null;
         this.pending = false;
+        this.workingDirectory = workingDirectory;
+        this.resolveRepository = resolveRepository;
+        this.schedule = schedule;
+        this.unschedule = unschedule;
+        this.timer = null;
+        this.background = null;
     }
     get statePath() { return path.join(this.root, "consent", `${sessionKey(this.session.sessionId)}.json`); }
     async settings() {
@@ -48,23 +57,79 @@ export class ArchiveController {
         return state;
     }
     async initialize(source = "startup") {
+        this.dispose();
         try {
             const config = await this.settings();
             if (!config) {
                 await this.notify("Not configured. Run node archive.mjs configure --repo OWNER/REPO against a private repository, then start a NEW conversation. No export/upload occurred.", "warning");
                 return;
             }
-            const state = await withLock(this.root, this.session.sessionId, () => this.consent(config, false, source));
+            const state = await withLock(this.root, this.session.sessionId, async () => {
+                let saved = await readJson(this.statePath, null);
+                if (saved && saved.binding !== binding(config)) {
+                    await this.notify("Destination/policy changed. Automatic capture is disabled for this existing session; start a new session or explicitly use /archive-consent. Frozen pending data was not redirected.", "warning");
+                    return null;
+                }
+                if (saved && !saved.automatic) return saved;
+                const repository = await this.resolveRepository(this.workingDirectory);
+                if (!repository.private) {
+                    await this.notify("Working repository is not private; automatic capture/sync is disabled.", "warning");
+                    return null;
+                }
+                await verifyDestination(config, this.localTest);
+                const roots = outputRoots(repository, this.session.workspacePath);
+                const scope = scopeBinding(binding(config), repository, roots);
+                if (saved) {
+                    if (saved.scope !== scope || saved.automatic !== AUTO_POLICY) throw new Error("Automatic session scope changed; refusing to reuse approval/baseline. Start a new session.");
+                    return saved;
+                }
+                if (source === "resume") {
+                    await this.notify("Resumed session has no capture baseline; automatic capture starts with new sessions only.", "warning");
+                    return null;
+                }
+                const baseline = await scanOutputs(roots, this.root);
+                saved = { version: 2, binding: binding(config), accepted: true, automatic: AUTO_POLICY,
+                    scope, repository: repository.repo, roots, baseline: baseline.files, artifacts: [], pending: [] };
+                await atomicJson(this.statePath, saved);
+                return saved;
+            });
             this.pending = !!state?.pending?.length;
-            if (this.pending) await this.notify("Frozen approved checkpoints are waiting for upload. /archive-sync retries them before capturing new history.", "warning");
+            if (state?.accepted) this.startTimer();
         } catch (error) { await this.notify(`Startup failed closed: ${error.message}`, "error"); }
+    }
+    startTimer() {
+        if (this.timer !== null) return;
+        this.timer = this.schedule(() => {
+            if (this.background) return;
+            this.background = this.checkpoint().finally(() => { this.background = null; });
+        }, SYNC_INTERVAL);
+        this.timer.unref?.();
+    }
+    dispose() {
+        if (this.timer !== null) this.unschedule(this.timer);
+        this.timer = null;
     }
     async sync() {
         return this.enqueue(async () => {
             const config = await this.settings();
             if (!config) throw new Error("Archive is not configured.");
             const state = await readJson(this.statePath, null);
-            if (!state?.accepted || state.binding !== binding(config)) throw new Error("No current human consent for this destination/scope. Use /archive-consent in an interactive host.");
+            if (!state?.accepted || state.binding !== binding(config)) {
+                this.dispose();
+                throw new Error("No current human consent for this destination/scope. Start a new private-repo session or use /archive-consent in an interactive host.");
+            }
+            let outputs = { approvals: [], omissions: [] };
+            if (state.automatic) {
+                const repository = await this.resolveRepository(this.workingDirectory);
+                if (!repository.private) { this.dispose(); throw new Error("Working repository is no longer private. Automatic sync stopped without upload."); }
+                const roots = outputRoots(repository, this.session.workspacePath);
+                if (state.automatic !== AUTO_POLICY || state.scope !== scopeBinding(binding(config), repository, roots)) {
+                    this.dispose();
+                    throw new Error("Automatic workspace scope changed; sync stopped without upload.");
+                }
+                await verifyDestination(config, this.localTest);
+                outputs = await changedOutputs(roots, state.baseline, this.root);
+            }
             const store = this.storeOverride || new ArchiveStore(this.root, config, { localTest: this.localTest });
             state.pending ||= [];
             const drain = async () => {
@@ -78,13 +143,22 @@ export class ArchiveController {
                     state.lastSynced = result.checkpoint;
                     await atomicJson(this.statePath, state);
                     await fs.rm(local, { recursive: true, force: true });
-                    if (frozen.manifest.omissions.length) await this.notify(`${frozen.manifest.omissions.length} omissions/redactions; see the archived manifest.`, "warning");
+                    const warning = JSON.stringify(frozen.manifest.omissions);
+                    if (frozen.manifest.omissions.length && state.lastOmissions !== warning) {
+                        await this.notify(`${frozen.manifest.omissions.length} omissions/redactions; see the archived manifest.`, "warning");
+                        state.lastOmissions = warning;
+                        await atomicJson(this.statePath, state);
+                    }
                 }
                 this.pending = false;
             };
             await drain();
             const events = await this.session.getEvents();
-            const capture = await snapshot(this.session.sessionId, events, state.artifacts);
+            const automaticPaths = new Set(outputs.approvals.map((a) => a.path));
+            const approvals = [...state.artifacts.filter((a) => !automaticPaths.has(a.path)), ...outputs.approvals];
+            const capture = await snapshot(this.session.sessionId, events, approvals,
+                { automatic: !!state.automatic, omissions: outputs.omissions });
+            if (capture.id === state.lastSynced) return { checkpoint: state.lastSynced };
             const local = path.join(this.root, "pending", sessionKey(this.session.sessionId), capture.id);
             await writeSnapshot(local, capture);
             state.pending.push(capture.id);
@@ -112,14 +186,16 @@ export class ArchiveController {
                         const config = await this.settings();
                         if (!config) throw new Error("Configure the private archive destination first.");
                         const state = await this.consent(config, true);
-                        await this.notify(state?.accepted ? "Approved for this destination/scope; next completed turn or /archive-sync captures history." : "Not approved; no new history export/upload.");
+                        this.dispose();
+                        if (state?.accepted) this.startTimer();
+                        await this.notify(state?.accepted ? "Approved for this destination/scope; automatic sync runs every five minutes, or use /archive-sync." : "Not approved; no new history export/upload.");
                     });
                     break;
                 }
                 case "archive-status": {
                     const config = await this.settings();
                     const state = await readJson(this.statePath, null);
-                    await this.notify(JSON.stringify({ configured: !!config, destination: config?.destination.repo, consent: !!(config && state?.accepted && state.binding === binding(config)), approvedFiles: state?.artifacts.length || 0, pending: state?.pending?.length || 0 }));
+                    await this.notify(JSON.stringify({ configured: !!config, destination: config?.destination.repo, consent: !!(config && state?.accepted && state.binding === binding(config)), automaticOutputs: !!state?.automatic, intervalMinutes: 5, schedulerRunning: this.timer !== null, approvedFiles: state?.artifacts.length || 0, pending: state?.pending?.length || 0 }));
                     break;
                 }
                 case "archive-sync": {
@@ -143,14 +219,16 @@ export class ArchiveController {
                         if (!yes) return;
                         state.artifacts = state.artifacts.filter((a) => a.path !== approved.path).concat(approved);
                         await atomicJson(this.statePath, state);
-                        await this.notify("File revision approved; use /archive-sync or complete a turn to upload.");
+                        await this.notify("File revision approved; sync runs every five minutes, or use /archive-sync.");
                     });
                     break;
                 }
                 case "archive-stop": {
                     await this.enqueue(async () => {
                         const config = await this.settings();
-                        if (config) await atomicJson(this.statePath, { version: 1, binding: binding(config), accepted: false, artifacts: [], pending: [] });
+                        const state = await readJson(this.statePath, {});
+                        if (config) await atomicJson(this.statePath, { ...state, version: 2, binding: binding(config), accepted: false, artifacts: [], pending: [] });
+                        this.dispose();
                         const pending = path.join(this.root, "pending", sessionKey(this.session.sessionId));
                         await fs.rm(pending, { recursive: true, force: true });
                         this.pending = false;
@@ -221,9 +299,9 @@ export class ArchiveController {
 
 export const commandNames = ["archive-consent", "archive-status", "archive-sync", "archive-artifact", "archive-stop", "archive-list", "archive-load"];
 export async function startExtension(joinSession, options = {}) {
-    let controller, startupSource = "startup";
+    let controller, startupSource = "startup", workingDirectory = options.workingDirectory || process.cwd();
     const session = await joinSession({
-        hooks: { onSessionStart: async (input) => { startupSource = input.source; } },
+        hooks: { onSessionStart: async (input) => { startupSource = input.source; workingDirectory = input.workingDirectory || workingDirectory; } },
         commands: commandNames.map((name) => ({
             name, description: `Conversation archive: ${name.slice(8)}`,
             handler: async (context) => {
@@ -241,16 +319,8 @@ export async function startExtension(joinSession, options = {}) {
             },
         }],
     });
-    controller = new ArchiveController(session, options);
+    controller = new ArchiveController(session, { ...options, workingDirectory });
     await controller.initialize(startupSource);
-    session.on("session.idle", () => {
-        // Do not invoke the event API at all for declined/unconfigured sessions.
-        controller.enqueue(async () => {
-            const config = await controller.settings();
-            const state = await readJson(controller.statePath, null);
-            return !!(config && state?.accepted && state.binding === binding(config));
-        }).then((accepted) => { if (accepted) return controller.checkpoint(); })
-            .catch((error) => controller.notify(`Checkpoint scheduling failed: ${error.message}`, "error"));
-    });
+    session.on("session.shutdown", () => controller.dispose());
     return controller;
 }

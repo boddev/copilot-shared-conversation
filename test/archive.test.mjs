@@ -76,23 +76,15 @@ test("redaction catches credentials and restricted wrappers while retaining busi
     for (const secret of ["PRIVATE PATH", "abc", "xyz", "token=secret", "github_pat_", "a:b@"]) assert.ok(!cleaned.includes(secret));
 });
 
-test("automatic joining prompts once after join; consent survives resume/reload; headless and decline do not read/export", async (t) => {
+test("manual consent remains human-only, persists decisions and fails closed without elicitation", async (t) => {
     const root = await sandbox(t), config = fakeConfig();
     for (const decision of [false, null, true]) {
         const mock = mockSession(`decision-${decision}`, decision);
-        let registered, joined = false;
-        const controller = await startExtension(async (options) => {
-            registered = options;
-            await options.hooks.onSessionStart({ source: "new" });
-            joined = true;
-            const original = mock.session.ui.confirm;
-            mock.session.ui.confirm = async (...args) => { assert.equal(joined, true); return original(...args); };
-            return mock.session;
-        }, { root, config, localTest: true, store: { publish: async () => ({ checkpoint: "synthetic" }) } });
+        const controller = new ArchiveController(mock.session, { root, config, localTest: true });
+        await controller.consent(config, true);
         assert.equal(mock.state.confirms.length, 1);
-        assert.equal(registered.tools.some((tool) => /consent|export|sync/.test(tool.name)), false);
         assert.equal(mock.state.reads, 0);
-        await controller.initialize("resume");
+        await controller.consent(config);
         assert.equal(mock.state.confirms.length, 1);
         if (decision !== true) {
             await assert.rejects(controller.sync(), /human consent/);
@@ -102,13 +94,13 @@ test("automatic joining prompts once after join; consent survives resume/reload;
     }
     const headless = mockSession("headless", true, false);
     const controller = new ArchiveController(headless.session, { root, config });
-    await controller.initialize("new");
+    await controller.consent(config, true);
     assert.equal(headless.state.confirms.length, 0);
     assert.equal(headless.state.reads, 0);
     assert.match(headless.state.logs[0].message, /elicitation is unavailable/);
     assert.equal(await readJson(controller.statePath, null), null);
     const old = mockSession("old-resume");
-    await new ArchiveController(old.session, { root, config }).initialize("resume");
+    await new ArchiveController(old.session, { root, config }).consent(config, false, "resume");
     assert.equal(old.state.confirms.length, 0);
     assert.match(old.state.logs[0].message, /older session/);
 });
@@ -116,11 +108,11 @@ test("automatic joining prompts once after join; consent survives resume/reload;
 test("reconfiguration invalidates consent, requires a new human decision, and rejected retry is inert", async (t) => {
     const root = await sandbox(t), mock = mockSession();
     const controller = new ArchiveController(mock.session, { root, config: fakeConfig(), localTest: true });
-    await controller.initialize("new");
+    await controller.consent(controller.configOverride, true);
     controller.configOverride = fakeConfig(path.resolve("different.git"));
     await assert.rejects(controller.sync(), /human consent/);
     mock.session.ui.confirm = async (message) => { mock.state.confirms.push(message); return false; };
-    await controller.initialize("resume");
+    await controller.consent(controller.configOverride, true);
     assert.equal(mock.state.confirms.length, 2);
     await assert.rejects(controller.sync(), /human consent/);
     assert.equal(mock.state.reads, 0);
@@ -225,7 +217,7 @@ test("different-session concurrent writer is preserved by non-force retry; same-
 test("failed upload is visible and retains consented pending history; manual retry publishes", async (t) => {
     const { root, remote, config } = await localRemote(t), mock = mockSession("retry");
     const controller = new ArchiveController(mock.session, { root: path.join(root, "machine"), config, localTest: true });
-    await controller.initialize("new");
+    await controller.consent(config, true);
     const offline = `${remote}.offline`;
     await fs.rename(remote, offline);
     await controller.checkpoint();
@@ -269,7 +261,7 @@ test("frozen approved output survives failed upload, file changes and restart; r
     const originalHash = hash(await fs.readFile(file));
     const mock = mockSession("frozen-retry");
     const controller = new ArchiveController(mock.session, { root: machine, config, localTest: true });
-    await controller.initialize("new");
+    await controller.consent(config, true);
     const state = await readJson(controller.statePath);
     state.artifacts = [await artifactApproval(file)];
     await atomicJson(controller.statePath, state);
@@ -299,20 +291,26 @@ test("frozen approved output survives failed upload, file changes and restart; r
     assert.equal((await readJson(resumed.statePath)).pending.length, 0);
 });
 
-test("completed-turn idle callback automatically syncs only approved sessions", async (t) => {
+test("background timer replaces completed-turn uploads and skips unapproved sessions", async (t) => {
     const root = await sandbox(t), config = fakeConfig();
     for (const accepted of [true, false]) {
         const mock = mockSession(`idle-${accepted}`, accepted);
         let uploads = 0;
-        const controller = await startExtension(async (options) => {
-            await options.hooks.onSessionStart({ source: "new" });
-            return mock.session;
-        }, { root, config, localTest: true, store: { publish: async (_key, capture) => { uploads++; return { checkpoint: capture.id }; } } });
-        mock.state.handlers.get("session.idle")({});
-        const deadline = Date.now() + 3000;
-        while (accepted && !uploads && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-        await controller.queue;
+        let tick, interval;
+        const controller = new ArchiveController(mock.session, { root, config, localTest: true,
+            setInterval: (callback, milliseconds) => { tick = callback; interval = milliseconds; return { unref() {} }; },
+            clearInterval: () => {},
+            store: { publish: async (_key, capture) => { uploads++; return { checkpoint: capture.id }; } } });
+        await controller.consent(config, true);
+        await controller.initialize("resume");
+        assert.equal(mock.state.handlers.has("session.idle"), false);
+        if (accepted) {
+            assert.equal(interval, 300000);
+            tick();
+            await controller.background;
+        } else assert.equal(tick, undefined);
         assert.equal(uploads, accepted ? 1 : 0);
         assert.equal(mock.state.reads, accepted ? 1 : 0);
+        controller.dispose();
     }
 });

@@ -17,10 +17,12 @@ $files = @(
     'extensions\archive\extension.mjs',
     'extensions\archive\controller.mjs',
     'extensions\archive\core.mjs',
+    'extensions\archive\automatic.mjs',
     'test\archive.test.mjs',
+    'test\automatic.test.mjs',
     'test\runtime-smoke.mjs'
 )
-$zip = Join-Path $output 'conversation-archive-0.1.0.zip'
+$zip = Join-Path $output 'conversation-archive-0.2.0.zip'
 if (Test-Path -LiteralPath $zip) { throw "Refusing to overwrite existing package: $zip" }
 try {
     foreach ($file in $files) {
