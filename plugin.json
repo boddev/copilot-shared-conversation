@@ -1,0 +1,6 @@
+{
+  "name": "conversation-archive",
+  "version": "0.1.0",
+  "description": "Opt-in portable conversation history and individually approved artifacts in a private GitHub archive.",
+  "extensions": ["extensions/"]
+}
