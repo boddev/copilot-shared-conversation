@@ -256,24 +256,37 @@ export class ArchiveStore {
         const directory = await fs.mkdtemp(path.join(jobs, "git-"));
         try {
             await this.git(directory, ["init", "--quiet"]);
+            await fs.writeFile(path.join(directory, ".git", "info", "attributes"), "* -filter -text -eol -ident -working-tree-encoding\n");
             await this.git(directory, ["remote", "add", "origin", this.config.destination.remote]);
             const ref = `refs/heads/${this.config.destination.branch}`;
             const { stdout } = await this.git(directory, ["ls-remote", "--heads", "origin", ref]);
             if (stdout.trim()) {
                 await this.git(directory, ["fetch", "--quiet", "origin", ref]);
-                const tree = await this.git(directory, ["ls-tree", "-r", "--name-only", "-z", "FETCH_HEAD"]);
-                const files = tree.stdout.split("\0").filter(Boolean);
-                for (const file of files) {
-                    if (readOnly && file !== "conversations" && !file.startsWith("conversations/")) continue;
-                    if ((file !== "README.md" && !/^conversations\/[a-f0-9]{64}\/(?:latest\.json|checkpoints\/[a-f0-9]{64}\/(?:manifest\.json|READ-ME-FIRST\.txt|history\.jsonl|transcript\.md|(?:blobs|artifacts)\/[A-Za-z0-9_.-]+))$/.test(file)) || file.includes("..")) {
-                        throw new Error("Archive branch contains unexpected paths. Use a dedicated archive repository (an initial README.md is supported).");
+                const tree = await this.git(directory, ["ls-tree", "-r", "-z", "FETCH_HEAD"]);
+                const sessions = new Set();
+                for (const entry of tree.stdout.split("\0").filter(Boolean)) {
+                    const match = /^([0-7]+) ([a-z]+) ([a-f0-9]+)\t([\s\S]+)$/.exec(entry);
+                    if (!match) throw new Error("Invalid Git tree entry.");
+                    const [, mode, type, , file] = match;
+                    if (file === "conversations") throw new Error("The reserved conversations path must be a directory, not a file/link/submodule.");
+                    const owned = /^(conversations\/[a-f0-9]{64})(?:\/|$)/.exec(file);
+                    if (!owned) continue;
+                    if (mode !== "100644" || type !== "blob" ||
+                        !/^conversations\/[a-f0-9]{64}\/(?:latest\.json|checkpoints\/[a-f0-9]{64}\/(?:manifest\.json|READ-ME-FIRST\.txt|history\.jsonl|transcript\.md|(?:blobs|artifacts)\/[A-Za-z0-9_.-]+))$/.test(file) || file.includes("..")) {
+                        throw new Error(`Unsafe or unexpected native archive path: ${file}`);
                     }
+                    sessions.add(owned[1]);
                 }
-                if (readOnly) {
-                    if (files.some((file) => file.startsWith("conversations/"))) {
-                        await this.git(directory, ["checkout", "--quiet", "FETCH_HEAD", "--", "conversations"]);
-                    }
-                } else await this.git(directory, ["checkout", "--quiet", "-b", "archive-work", "FETCH_HEAD"]);
+                if (!readOnly) {
+                    // Retain every existing tree entry in the index without executing or materializing source files.
+                    await this.git(directory, ["update-ref", "refs/heads/archive-work", "FETCH_HEAD"]);
+                    await this.git(directory, ["symbolic-ref", "HEAD", "refs/heads/archive-work"]);
+                    await this.git(directory, ["read-tree", "FETCH_HEAD"]);
+                }
+                const roots = [...sessions];
+                for (let offset = 0; offset < roots.length; offset += 50) {
+                    await this.git(directory, ["--literal-pathspecs", "checkout", "--quiet", "FETCH_HEAD", "--", ...roots.slice(offset, offset + 50)]);
+                }
             } else await this.git(directory, ["checkout", "--quiet", "--orphan", "archive-work"]);
             return directory;
         } catch (error) {
@@ -316,7 +329,7 @@ export class ArchiveStore {
                     await writeSnapshot(checkpoint, capture);
                 }
                 await atomicJson(path.join(sessionDir, "latest.json"), { checkpoint: capture.id, eventCount: capture.manifest.eventCount });
-                await this.git(directory, ["add", "--", `conversations/${key}`]);
+                await this.git(directory, ["add", "--force", "--", `conversations/${key}`]);
                 await this.git(directory, ["-c", "user.name=Conversation Archive", "-c", "user.email=archive@localhost",
                     "commit", "--quiet", "-m", `Archive ${key.slice(0, 12)} checkpoint ${capture.id.slice(0, 12)}`]);
                 if (this.beforePush) await this.beforePush(attempt);
@@ -332,38 +345,53 @@ export class ArchiveStore {
         }
         throw lastError;
     }
-    async list() {
+    async list({ includeLegacy = true } = {}) {
         const directory = await this.checkout({ readOnly: true });
+        const records = [];
         try {
             await assertNoLinks(directory);
             const conversations = path.join(directory, "conversations");
             let entries;
             try { entries = await fs.readdir(conversations, { withFileTypes: true }); }
-            catch (error) { if (error.code === "ENOENT") return []; throw error; }
-            const records = [];
+            catch (error) { if (error.code !== "ENOENT") throw error; entries = []; }
             for (const entry of entries) {
                 if (!entry.isDirectory() || !/^[a-f0-9]{64}$/.test(entry.name)) continue;
                 const latest = await readJson(path.join(conversations, entry.name, "latest.json"));
-                if (!/^[a-f0-9]{64}$/.test(latest.checkpoint || "")) throw new Error("Invalid checkpoint pointer.");
+                if (!/^[a-f0-9]{64}$/.test(latest?.checkpoint || "")) throw new Error("Invalid checkpoint pointer.");
                 const checkpoints = (await fs.readdir(path.join(conversations, entry.name, "checkpoints"))).filter((name) => /^[a-f0-9]{64}$/.test(name));
                 const capture = await readSnapshot(path.join(conversations, entry.name, "checkpoints", latest.checkpoint), latest.checkpoint);
                 const first = capture.files.get("history.jsonl").toString("utf8").split("\n").filter(Boolean)
                     .map((line) => JSON.parse(line)).find((event) => event.type === "user.message");
                 const data = first?.dataRef ? JSON.parse(capture.files.get(first.dataRef.file).toString("utf8")) : first?.data;
                 const title = typeof data?.content === "string" ? redactText(data.content).replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 120) : undefined;
-                records.push({ session: entry.name, ...latest, checkpoints, title });
+                records.push({ session: entry.name, ...latest, checkpoints, title, branch: this.config.destination.branch });
             }
-            return records;
         } finally { await fs.rm(directory, { recursive: true, force: true }); }
+        if (includeLegacy && this.config.destination.branch === "main") {
+            const legacy = new ArchiveStore(this.root, { ...this.config, destination: { ...this.config.destination, branch: "archive" } }, { localTest: this.localTest });
+            const current = new Set(records.map((record) => record.session));
+            records.push(...(await legacy.list({ includeLegacy: false })).filter((record) => !current.has(record.session)));
+        }
+        return records;
     }
-    async import(key, destination, selectedCheckpoint) {
+    async import(key, destination, selectedCheckpoint, { branch } = {}) {
         if (!/^[a-f0-9]{64}$/.test(key)) throw new Error("Select an exact session ID from archive list.");
+        if (branch && branch !== this.config.destination.branch) {
+            if (this.config.destination.branch !== "main" || branch !== "archive") throw new Error("Invalid archive branch selection.");
+            return new ArchiveStore(this.root, { ...this.config, destination: { ...this.config.destination, branch } }, { localTest: this.localTest })
+                .import(key, destination, selectedCheckpoint);
+        }
         const directory = await this.checkout({ readOnly: true });
         try {
             await assertNoLinks(directory);
             const sessionDir = path.join(directory, "conversations", key);
-            const latest = await readJson(path.join(sessionDir, "latest.json"));
-            if (!/^[a-f0-9]{64}$/.test(latest.checkpoint || "")) throw new Error("Invalid checkpoint pointer.");
+            const missing = Symbol("missing checkpoint");
+            const latest = await readJson(path.join(sessionDir, "latest.json"), missing);
+            if (latest === missing && !branch && this.config.destination.branch === "main") {
+                return await this.import(key, destination, selectedCheckpoint, { branch: "archive" });
+            }
+            if (latest === missing) throw new Error(`Saved conversation was not found on ${this.config.destination.branch}. Use /archive-list to refresh.`);
+            if (!/^[a-f0-9]{64}$/.test(latest?.checkpoint || "")) throw new Error("Invalid checkpoint pointer.");
             const checkpoint = selectedCheckpoint || latest.checkpoint;
             if (!/^[a-f0-9]{64}$/.test(checkpoint)) throw new Error("Invalid selected checkpoint.");
             const source = path.join(sessionDir, "checkpoints", checkpoint);

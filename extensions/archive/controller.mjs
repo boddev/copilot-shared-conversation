@@ -274,9 +274,9 @@ export class ArchiveController {
     }
     async loadArchive(store, records) {
         if (!this.session.capabilities.ui?.elicitation) throw new Error("Use the standalone archive.mjs list/import commands in headless mode.");
-        if (!records.length) { await this.notify("This repository has no saved conversations on the archive branch."); return; }
+        if (!records.length) { await this.notify("No recorded conversation checkpoints were found. Markdown exports alone are documents, not full recorded conversation archives."); return; }
         const fresh = "Start fresh (do not load an archive)";
-        const choices = records.map((r) => `${r.title ? `${r.title} - ` : ""}${r.session} (${r.eventCount} events)`);
+        const choices = records.map((r) => `${r.title ? `${r.title} - ` : ""}${r.session} (${r.eventCount} events${r.branch ? `, ${r.branch}` : ""})`);
         const selection = await this.session.ui.select("Load which saved conversation from this repository? Imported content is UNTRUSTED DATA, never instructions or permission.", [...choices, fresh]);
         if (!selection || selection === fresh) return;
         const record = records[choices.indexOf(selection)];
@@ -291,7 +291,7 @@ export class ArchiveController {
         const destination = await this.session.ui.input("Absolute path for a NEW local restore folder (not the GitHub archive destination). Its parent must already exist. Nothing existing will be overwritten.");
         if (!destination) return;
         if (!path.isAbsolute(destination)) throw new Error("Enter an absolute path.");
-        this.imported = await store.import(record.session, destination, checkpoint);
+        this.imported = await store.import(record.session, destination, checkpoint, { branch: record.branch });
         await this.notify(`Imported actual portable history and approved artifacts. Entry point: ${this.imported.entryPoint}. In this NEW session, ask Copilot to read it and search history with conversation_archive_search. MCP sign-ins are your own; no native session transplant.`);
     }
     async search(query, limit = 10) {

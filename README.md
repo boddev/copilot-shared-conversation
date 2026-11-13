@@ -80,13 +80,29 @@ The conversation picker always reads the **current repository**, not a different
 machine-wide capture target. An explicit branch override is honored when the
 configured target is this same repository.
 
+When reading `main`, the picker also discovers native checkpoints still on the
+legacy `archive` branch. Choices show their branch; if a conversation exists on
+both, the `main` copy takes precedence. Selecting a legacy conversation restores
+its actual recorded history and artifacts from that branch, without moving or
+rewriting either branch. Standalone import by session ID supports the same
+legacy lookup. New captures still publish only to the configured branch (`main`
+by default).
+
+Ordinary files, including Markdown exports such as `conversations/report.md`,
+do not block archive discovery or publication. They remain untouched in Git.
+Markdown exports alone are not native recorded conversations and are not
+presented as complete history; the picker lists validated native checkpoints.
+If `main` contains only Markdown exports and `archive` contains the original
+recorded session, the original session is what appears in the picker.
+
 If you work in a separate source repository, or use the standalone recipient CLI,
 you can configure a dedicated **private archive** target with the commands below.
-Automatic publication still expects an archive-shaped destination (archive paths
-plus an optional initial `README.md`); it does not write into an arbitrary source
-tree. Read-only listing/import can coexist with ordinary source files and only
-checks out archive paths. The plugin neither creates a repository nor accepts
-public targets. Conversations commit directly to **`main`** by default, including
+Listing, import and publication check out only native archive paths; publication
+preserves the rest of the repository's existing tree in the Git index. Unrelated
+source, Markdown documents, configuration and attribute files are never executed
+or materialized in the disposable Git workspace. The plugin neither creates a
+repository nor accepts public targets. Conversations commit directly to
+**`main`** by default, including
 the first commit to an empty repository. A repository initialized with `README.md`
 is supported: its README and existing commits are preserved. No per-conversation
 remote branches or separate `archive` branch are created.
@@ -104,7 +120,8 @@ credential helper. No credentials are stored by this package.
 
 Existing installations configured for `archive` should rerun the configure
 command above once (without `--branch`) to select `main` for new conversations.
-Saved history on the old branch is not moved, deleted or overwritten. Existing
+Saved history on the old branch remains discoverable and is not moved, deleted
+or overwritten. Existing
 sessions with an old destination binding fail closed rather than silently
 redirecting pending checkpoints; start a new conversation after switching.
 An explicit `--branch NAME` override remains available if you intentionally
@@ -144,7 +161,7 @@ and scope; public visibility, changed origin or verification errors stop uploads
 | `/archive-artifact` | Optional explicit approval for one output outside automatic roots, or for legacy/manual sessions. |
 | `/archive-sync` | Retry frozen pending checkpoints in order, then capture/upload current recorded history. |
 | `/archive-stop` | Stop this session, discard pending local exports and approvals; published Git history remains. |
-| `/archive-list` | List saved conversations from the current verified private GitHub repository, without archive setup. |
+| `/archive-list` | List saved conversations from the current verified private GitHub repository, including legacy `archive` checkpoints when reading `main`, without archive setup. |
 | `/archive-load` | Open that repository's conversation picker directly, then restore a checkpoint into a new local directory. Also offered automatically on new interactive sessions when archives exist. |
 
 Automatic checkpoints use a five-minute timer, **not completed-turn uploads**.
@@ -285,9 +302,11 @@ Publication checks private visibility each time, uses non-force push, and
 retries by fetching the current branch and reapplying this checkpoint.
 Different-session writers coexist. Same-conversation divergence, changed
 previous history or shrinking history fails explicitly rather than overwriting.
-The archive destination admits only its own checkpoint paths and an initial
-`README.md`, not arbitrary
-configuration, hooks or Git attribute files.
+Only native checkpoint paths are materialized and modified; other repository
+files are retained unchanged in the Git index. Native checkpoint entries must
+be regular files with validated paths. Repository hooks are disabled and
+disposable `.git/info/attributes` disables filters and content transformations,
+so existing `.gitattributes` cannot run programs or alter archived bytes.
 
 Frozen pending checkpoints are bound to persisted consent/scope and survive reload.
 `/archive-sync` drains them before taking a new snapshot. `/archive-status`
@@ -316,18 +335,25 @@ The synthetic tests use separate machine directories and a local bare Git remote
 verifying content/hashes, first publication, private-only automatic activation,
 headless startup, five-minute async/no-overlap scheduling, new/modified outputs
 including binary/session files, unchanged-file/runtime exclusions, opt-out/reload,
-privacy changes, MCP results, concurrency and frozen retry recovery.
+privacy changes, MCP results, concurrency and frozen retry recovery. Regression
+fixtures reproduce Markdown conversation exports on `main` with actual recorded
+history/artifacts on `archive`, verify their selection/import, and check that
+new publication preserves existing documents, source files and branch ancestry.
 No test uploads to GitHub or imports actual user history.
 
 An optional bounded real-runtime test creates an isolated `COPILOT_HOME`, loads
 this plugin, and verifies that unverified/non-repository workspaces fail closed,
 with and without configuration. It then uses a copied plugin with the actual
 controller and SDK UI, but injected synthetic visibility and local bare Git
-storage. The real host receives one automatic conversation-picker elicitation,
-which the harness declines; resume/reload must not show it again. No archive
+storage. The fixture has Markdown exports on `main` and a native checkpoint with
+a binary artifact on `archive`. The real host receives one automatic
+conversation-picker elicitation, which the harness declines; resume/reload must
+not show it again. The harness then executes the actual `/archive-load` command,
+answers its conversation/restore-folder forms, and verifies the restored history
+and artifact hashes with both remote branch refs unchanged. No archive
 configuration is supplied for this synthetic private session. This checks actual
-SDK picker wiring, not a human seeing the app dialog. No real GitHub archive is
-read or written, no model prompt is sent, and no active session is exported.
+SDK command/picker wiring, not a human seeing the app dialog. No real GitHub archive
+is read or written, no model prompt is sent, and no active session is exported.
 The harness grants only this synthetic extension's hook registration.
 A real private-GitHub/five-minute host check remains a manual integration check.
 

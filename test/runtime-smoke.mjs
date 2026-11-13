@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { ArchiveStore, atomicJson, command, readJson, redactText, sessionKey, snapshot } from "../extensions/archive/core.mjs";
+import { ArchiveStore, artifactApproval, atomicJson, command, hash, readJson, redactText, sessionKey, snapshot } from "../extensions/archive/core.mjs";
 
 const [sdkDirectory, cliLoader] = process.argv.slice(2);
 if (!sdkDirectory || !cliLoader) throw new Error("Usage: node test/runtime-smoke.mjs ABSOLUTE_SDK_DIRECTORY ABSOLUTE_CLI_NPM_LOADER");
@@ -54,10 +54,19 @@ try {
     await atomicJson(path.join(root, "archive", "config.json"), { version: 1,
         destination: { repo: "synthetic-owner/synthetic-archive", remote: "https://github.com/synthetic-owner/synthetic-archive.git" } });
     const requests = [];
+    let loadRequested = false;
+    const restoredDirectory = path.join(root, "restored-from-archive-load");
     const options = {
         workingDirectory: root, requestExtensions: true, pluginDirectories: [plugin],
         onPermissionRequest: permissionHandler,
-        onElicitationRequest: async (request) => { requests.push(request); return { action: "decline" }; },
+        onElicitationRequest: async (request) => {
+            requests.push(request);
+            if (!loadRequested) return { action: "decline" };
+            const fields = request.requestedSchema?.properties;
+            if (fields?.selection?.enum) return { action: "accept", content: { selection: fields.selection.enum[0] } };
+            if (fields?.value?.type === "string") return { action: "accept", content: { value: restoredDirectory } };
+            throw new Error("Unexpected synthetic archive-load elicitation schema.");
+        },
     };
     session = await client.createSession(options);
     await ready(session);
@@ -89,10 +98,22 @@ try {
     await command("git", ["init", "--bare", "--quiet", remote]);
     const config = { version: 1, destination: { remote, branch: "main", localTest: true } };
     const storeRoot = path.join(root, "synthetic-store");
-    const store = new ArchiveStore(storeRoot, config, { localTest: true });
-    await store.publish(sessionKey("previous-synthetic"), await snapshot("previous-synthetic", [
+    const legacy = new ArchiveStore(storeRoot, { ...config, destination: { ...config.destination, branch: "archive" } }, { localTest: true });
+    const report = path.join(root, "synthetic-report.bin");
+    const reportBytes = Buffer.from([0, 255, 17, 81, 13]);
+    await fs.writeFile(report, reportBytes);
+    const capture = await snapshot("previous-synthetic", [
         { id: "synthetic-request", type: "user.message", data: { content: "Synthetic previous conversation for startup picker" } },
-    ], []));
+    ], [await artifactApproval(report)]);
+    await legacy.publish(sessionKey("previous-synthetic"), capture);
+    const seed = path.join(root, "main-documents");
+    await fs.mkdir(path.join(seed, "conversations"), { recursive: true });
+    await command("git", ["init", "--quiet", "--initial-branch=main"], seed);
+    await fs.writeFile(path.join(seed, "conversations", "2026-01-01-synthetic-export.md"), "# Human-readable document, not a recorded checkpoint");
+    await command("git", ["add", "--all"], seed);
+    await command("git", ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@localhost", "commit", "--quiet", "-m", "Seed main document"], seed);
+    await command("git", ["push", "--quiet", remote, "main"], seed);
+    const originalRefs = (await command("git", ["ls-remote", "--heads", remote])).stdout;
     const syntheticPlugin = path.join(root, "synthetic-picker-plugin");
     await fs.mkdir(syntheticPlugin);
     await fs.copyFile(path.join(plugin, "plugin.json"), path.join(syntheticPlugin, "plugin.json"));
@@ -126,10 +147,22 @@ await startExtension(joinSession, {
     await session.rpc.extensions.reload();
     await ready(session);
     assert.equal(requests.length, 1, "Resume/reload must not show the picker again.");
+    loadRequested = true;
+    const loaded = await session.rpc.commands.execute({ commandName: "archive-load", args: "" });
+    assert.equal(loaded.error, undefined);
+    assert.equal(requests.length, 3, "Explicit archive-load must ask only for a saved conversation and a local restore folder.");
+    assert.match(JSON.stringify(requests[1]), /archive/);
+    assert.deepEqual(await fs.readFile(path.join(restoredDirectory, "history.jsonl")), capture.files.get("history.jsonl"));
+    const manifest = await readJson(path.join(restoredDirectory, "manifest.json"));
+    assert.equal(hash(await fs.readFile(path.join(restoredDirectory, ...manifest.artifacts[0].file.split("/")))), hash(reportBytes));
+    assert.equal((await command("git", ["ls-remote", "--heads", remote])).stdout, originalRefs);
+    await assert.rejects(fs.access(path.join(root, "archive", "pending")));
     console.log(JSON.stringify({ sdk: sdkDirectory, runtimeVersion: events.find((e) => e.type === "session.start")?.data.copilotVersion,
         pluginLoaded: true, extension: archive.name, status: archive.status, unverifiedWorkspaceDisabled: true,
-        automaticStartupConsentRequests: 0, automaticConversationPickerRequests: requests.length,
+        automaticStartupConsentRequests: 0, automaticConversationPickerRequests: 1,
         syntheticPickerDeclined: true, resumedWithoutRepeatedPicker: true, syntheticPrivateSessionActivated: true,
+        archiveLoadCommandExecuted: true, mixedMainDocumentsAndLegacyArchive: true,
+        actualHistoryAndArtifactHashesVerified: true, remoteBranchesUnchanged: true,
         externalVisibilityAndStorage: "synthetic local fixtures", modelPromptsSent: 0, githubUploads: 0 }));
 } catch (error) {
     if (session) {

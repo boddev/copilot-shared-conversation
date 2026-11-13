@@ -148,12 +148,12 @@ test("repository discovery reads only archive paths alongside ordinary source an
     assert.equal(hash(await fs.readFile(path.join(imported.directory, "history.jsonl"))), hash(capture.files.get("history.jsonl")));
     await assert.rejects(fs.access(path.join(imported.directory, "source.js")));
     await assert.rejects(fs.access(path.join(imported.directory, ".gitattributes")));
-    const invalid = "unexpected-\u00e9.txt";
-    await fs.writeFile(path.join(working, "conversations", invalid), "Malformed archive path, quoted by Git unless NUL-delimited");
-    await command("git", ["add", "--", `conversations/${invalid}`], working);
+    const invalid = `conversations/${key}/unexpected-\u00e9.txt`;
+    await fs.writeFile(path.join(working, ...invalid.split("/")), "Malformed native archive path, quoted by Git unless NUL-delimited");
+    await command("git", ["add", "--", invalid], working);
     await command("git", ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@localhost", "commit", "--quiet", "-m", "Add malformed fixture"], working);
     await command("git", ["push", "--quiet", "origin", "archive"], working);
-    await assert.rejects(store.list(), /unexpected paths/);
+    await assert.rejects(store.list(), /unexpected native archive path/);
 });
 
 test("artifact exact-revision consent, redaction, binary fidelity, sensitive paths and symlinks", async (t) => {
@@ -387,6 +387,132 @@ test("main is the first branch in an empty archive unless a destination branch i
     const branches = (await command("git", ["ls-remote", "--heads", remote])).stdout;
     assert.match(branches, /refs\/heads\/main/);
     assert.match(branches, /refs\/heads\/archive/);
-    assert.equal((await store.list()).length, 1);
+    assert.equal((await store.list()).length, 2, "Main readers also discover legacy conversations without moving them.");
+    assert.equal((await store.list({ includeLegacy: false })).length, 1);
     assert.equal((await legacy.list()).length, 1);
+});
+
+test("archive-load restores recorded legacy history and artifacts when main contains Markdown conversation exports", async (t) => {
+    const { root, remote, config: legacyConfig } = await localRemote(t);
+    const artifact = path.join(root, "synthetic-report.html");
+    const bytes = Buffer.from("<h1>Blue report</h1><p>60 / 3 = 20</p>");
+    await fs.writeFile(artifact, bytes);
+    const capture = await snapshot("legacy-recorded-session", fixtureEvents(), [await artifactApproval(artifact)]);
+    const key = sessionKey("legacy-recorded-session");
+    const legacy = new ArchiveStore(path.join(root, "legacy-writer"), legacyConfig, { localTest: true });
+    await legacy.publish(key, capture);
+    const seed = path.join(root, "main-seed");
+    await fs.mkdir(seed);
+    await command("git", ["init", "--quiet", "--initial-branch=main"], seed);
+    await fs.mkdir(path.join(seed, "conversations"));
+    await fs.writeFile(path.join(seed, "README.md"), "Synthetic private repo");
+    await fs.writeFile(path.join(seed, "conversations", "2026-01-01-synthetic-report.md"), "# Human-readable report export, not actual SDK event history");
+    await fs.writeFile(path.join(seed, "conversations", "2026-01-01-synthetic-snapshot.md"), "# Another human-readable export");
+    await command("git", ["add", "--all"], seed);
+    await command("git", ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@localhost", "commit", "--quiet", "-m", "Seed Markdown conversation exports"], seed);
+    await command("git", ["push", "--quiet", remote, "main"], seed);
+    const before = (await command("git", ["ls-remote", "--heads", remote])).stdout;
+    const config = { version: 1, destination: { remote, branch: "main", localTest: true } };
+    const store = new ArchiveStore(path.join(root, "new-machine"), config, { localTest: true });
+    const records = await store.list();
+    assert.equal(records.length, 1);
+    assert.equal(records[0].branch, "archive");
+    assert.equal(records[0].session, key);
+    assert.match(records[0].title, /Build a report/);
+    const mock = mockSession("new-recipient");
+    let selects = 0;
+    mock.session.ui.select = async (_message, choices) => { selects++; assert.match(choices[0], /archive/); return choices[0]; };
+    const restored = path.join(root, "restored");
+    mock.session.ui.input = async () => restored;
+    const controller = new ArchiveController(mock.session, { root: path.join(root, "recipient"), config, localTest: true, store });
+    await controller.runCommand({ commandName: "archive-load" });
+    assert.equal(selects, 1);
+    assert.equal(mock.state.reads, 0, "Loading must not export the new recipient conversation.");
+    assert.ok(!mock.state.logs.some((entry) => entry.level === "error"));
+    assert.equal(hash(await fs.readFile(path.join(restored, "history.jsonl"))), hash(capture.files.get("history.jsonl")));
+    assert.match(await fs.readFile(path.join(restored, "transcript.md"), "utf8"), /60 \/ 3 = 20/);
+    const archivedArtifact = controller.imported.manifest.artifacts[0];
+    assert.equal(hash(await fs.readFile(path.join(restored, ...archivedArtifact.file.split("/")))), hash(bytes));
+    assert.equal((await controller.search("synthetic-warehouse")).matches.length, 1);
+    assert.equal((await command("git", ["ls-remote", "--heads", remote])).stdout, before, "Loading must not move or rewrite either branch.");
+    const standalone = await store.import(key, path.join(root, "standalone-restored"));
+    assert.equal(standalone.manifest.eventCount, capture.manifest.eventCount);
+});
+
+test("publishing alongside repository files preserves their bytes and disables Git attributes/filters", async (t) => {
+    const { root, remote } = await localRemote(t);
+    const seed = path.join(root, "seed");
+    await fs.mkdir(path.join(seed, "conversations"), { recursive: true });
+    await command("git", ["init", "--quiet", "--initial-branch=main"], seed);
+    const files = {
+        "conversations/manual-export.md": "# Existing conversation document\n",
+        "source.js": "Synthetic source stays in the repo.\n",
+        ".gitattributes": "conversations/** text eol=crlf filter=synthetic\n",
+        ".gitignore": "conversations/\n",
+    };
+    for (const [file, contents] of Object.entries(files)) {
+        await fs.writeFile(path.join(seed, ...file.split("/")), contents);
+    }
+    await command("git", ["-c", "core.autocrlf=false", "add", "--force", "--all"], seed);
+    await command("git", ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@localhost", "commit", "--quiet", "-m", "Seed existing files"], seed);
+    await command("git", ["push", "--quiet", remote, "main"], seed);
+    const original = (await command("git", ["rev-parse", "HEAD"], seed)).stdout.trim();
+    const originalBlobs = {};
+    for (const file of Object.keys(files)) {
+        originalBlobs[file] = (await command("git", ["--git-dir", remote, "rev-parse", `main:${file}`])).stdout;
+    }
+    const marker = path.join(root, "filter-must-not-run");
+    const filter = path.join(root, "filter.mjs");
+    await fs.writeFile(filter, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "unexpected"); process.stdin.pipe(process.stdout);\n`);
+    const store = new ArchiveStore(path.join(root, "writer"), { version: 1, destination: { remote, localTest: true } }, { localTest: true });
+    const run = store.git.bind(store);
+    const filterCommand = `"${process.execPath.replaceAll("\\", "/")}" "${filter.replaceAll("\\", "/")}"`;
+    store.git = (directory, args) => run(directory, ["-c", `filter.synthetic.clean=${filterCommand}`,
+        "-c", `filter.synthetic.smudge=${filterCommand}`, "-c", "filter.synthetic.required=true", ...args]);
+    const capture = await snapshot("new-recorded-session", fixtureEvents(), []);
+    await store.publish(sessionKey("new-recorded-session"), capture);
+    await assert.rejects(fs.access(marker), "Repository filters must never execute.");
+    for (const file of Object.keys(files)) {
+        assert.equal((await command("git", ["--git-dir", remote, "rev-parse", `main:${file}`])).stdout, originalBlobs[file], file);
+    }
+    await command("git", ["--git-dir", remote, "merge-base", "--is-ancestor", original, "main"]);
+    assert.equal((await store.list()).length, 1);
+    const restored = await store.import(sessionKey("new-recorded-session"), path.join(root, "restored"));
+    assert.deepEqual(await fs.readFile(path.join(restored.directory, "history.jsonl")), capture.files.get("history.jsonl"));
+    await assert.rejects(fs.access(path.join(restored.directory, "source.js")));
+    await assert.rejects(fs.access(marker), "Read-only checkout must not execute smudge filters either.");
+});
+
+test("main wins duplicate legacy session IDs and Markdown-only repositories do not invent recorded history", async (t) => {
+    const { root, remote, config: legacyConfig } = await localRemote(t);
+    const main = new ArchiveStore(path.join(root, "main"), { version: 1, destination: { remote, localTest: true } }, { localTest: true });
+    const legacy = new ArchiveStore(path.join(root, "legacy"), legacyConfig, { localTest: true });
+    const old = await snapshot("same-id", fixtureEvents(), []);
+    const newer = await snapshot("same-id", [...fixtureEvents(), { id: "new", type: "user.message", data: { content: "Continue the actual recorded report" } }], []);
+    await legacy.publish(sessionKey("same-id"), old);
+    await main.publish(sessionKey("same-id"), newer);
+    const records = await main.list();
+    assert.equal(records.length, 1);
+    assert.equal(records[0].branch, "main");
+    assert.equal(records[0].checkpoint, newer.id);
+    await assert.rejects(main.import(sessionKey("same-id"), path.join(root, "wrong-branch"), newer.id, { branch: "unrelated" }), /Invalid archive branch/);
+    const corrupt = await main.checkout();
+    try {
+        const pointer = `conversations/${sessionKey("same-id")}/latest.json`;
+        await fs.writeFile(path.join(corrupt, ...pointer.split("/")), "null\n");
+        await main.git(corrupt, ["add", "--force", "--", pointer]);
+        await main.git(corrupt, ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@localhost", "commit", "--quiet", "-m", "Corrupt synthetic pointer"]);
+        await main.git(corrupt, ["push", "--quiet", "origin", "HEAD:main"]);
+    } finally { await fs.rm(corrupt, { recursive: true, force: true }); }
+    await assert.rejects(main.import(sessionKey("same-id"), path.join(root, "corrupt-pointer")), /Invalid checkpoint pointer/, "Corrupt main history must fail, not silently fall back to an older branch.");
+    const fresh = await localRemote(t);
+    const seed = path.join(fresh.root, "markdown-seed");
+    await fs.mkdir(path.join(seed, "conversations"), { recursive: true });
+    await command("git", ["init", "--quiet", "--initial-branch=main"], seed);
+    await fs.writeFile(path.join(seed, "conversations", "manual.md"), "# A summary is not a recorded conversation");
+    await command("git", ["add", "--all"], seed);
+    await command("git", ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@localhost", "commit", "--quiet", "-m", "Seed summary"], seed);
+    await command("git", ["push", "--quiet", fresh.remote, "main"], seed);
+    const documentOnly = new ArchiveStore(path.join(fresh.root, "reader"), { version: 1, destination: { remote: fresh.remote, localTest: true } }, { localTest: true });
+    assert.deepEqual(await documentOnly.list(), []);
 });
