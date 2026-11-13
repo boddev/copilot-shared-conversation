@@ -7,8 +7,11 @@ conversation history and session-created/modified output files to the configured
 Background sync runs asynchronously every **five minutes**, without success chatter.
 
 The plugin includes an SDK extension, a dependency-free setup/import CLI, and
-synthetic tests. No target repository is preconfigured. Configure the destination
-once on each machine; automatic capture then applies to new private-repo sessions.
+synthetic tests. When opening your private archive repository, its verified GitHub
+`origin` and `main` are the defaults: **no destination setup is required on a new
+machine**. New interactive conversations automatically show saved conversations
+from that repository, labeled with their first user message. Choose one to restore,
+or choose **Start fresh**. Resume/reload does not repeat the startup picker.
 Public repositories, missing origins and unverifiable privacy fail closed.
 
 ## Requirements and supported installation
@@ -60,10 +63,29 @@ The host may ask permission to register extension hooks. That approval is
 separate from archive configuration. Declining hook approval prevents the
 extension from loading; the plugin never bypasses host trust or managed policy.
 
-## Configure each machine
+## Repository defaults and optional configuration
 
-Use an existing **private archive** GitHub repository chosen by you, not this
-configuration repository. The plugin neither creates a repository nor accepts
+Install the plugin, clone/open your **private archive repository** in the Copilot
+app, and start a new conversation. The plugin discovers the repository from the
+session's working directory, verifies its private GitHub origin, and lists its
+saved conversations automatically. `/archive-load` opens the picker again at any
+time; you do not have to run `/archive-list` or enter an archive repository first.
+The only destination question during loading is for a **new local restore folder**,
+not the GitHub archive destination. Its parent must exist; existing files are never
+overwritten. MCP sign-ins remain your own.
+
+For capture, an existing machine-wide configuration still takes precedence.
+Without one, the current verified private repository on `main` is used.
+The conversation picker always reads the **current repository**, not a different
+machine-wide capture target. An explicit branch override is honored when the
+configured target is this same repository.
+
+If you work in a separate source repository, or use the standalone recipient CLI,
+you can configure a dedicated **private archive** target with the commands below.
+Automatic publication still expects an archive-shaped destination (archive paths
+plus an optional initial `README.md`); it does not write into an arbitrary source
+tree. Read-only listing/import can coexist with ordinary source files and only
+checks out archive paths. The plugin neither creates a repository nor accepts
 public targets. Conversations commit directly to **`main`** by default, including
 the first commit to an empty repository. A repository initialized with `README.md`
 is supported: its README and existing commits are preserved. No per-conversation
@@ -122,8 +144,8 @@ and scope; public visibility, changed origin or verification errors stop uploads
 | `/archive-artifact` | Optional explicit approval for one output outside automatic roots, or for legacy/manual sessions. |
 | `/archive-sync` | Retry frozen pending checkpoints in order, then capture/upload current recorded history. |
 | `/archive-stop` | Stop this session, discard pending local exports and approvals; published Git history remains. |
-| `/archive-list` | List saved conversation IDs, latest checkpoints and available older checkpoints. |
-| `/archive-load` | Select a saved conversation/checkpoint and restore into a new directory you choose. |
+| `/archive-list` | List saved conversations from the current verified private GitHub repository, without archive setup. |
+| `/archive-load` | Open that repository's conversation picker directly, then restore a checkpoint into a new local directory. Also offered automatically on new interactive sessions when archives exist. |
 
 Automatic checkpoints use a five-minute timer, **not completed-turn uploads**.
 The timer starts after privacy verification and baseline initialization; no
@@ -171,6 +193,8 @@ This is a workspace-change boundary, not perfect process attribution: other
 programs modifying files in the same roots during the session are also in scope.
 Use isolated worktrees when sessions should not share outputs.
 
+The repository's reserved `conversations` archive tree is not recaptured as
+generated output after a pull, preventing nested copies of other conversations.
 Only the current session's `files` tree is admitted from runtime storage, even
 when nested under the repo. Other session-state trees, Git internals, dependency
 trees, credentials/configuration, symlinks/junctions and archive state are excluded.
@@ -215,12 +239,15 @@ Use synthetic input for the first real-machine test.
    appear in the archive without routine success messages. Use `/archive-list`
    to inspect IDs. Resume/reload should preserve the baseline without prompts.
    `/archive-stop` must stop subsequent uploads and stay stopped after reload.
-4. On B, independently install/load the package and configure the same
-   `OWNER/REPO`. Sign in with B's own account and repository access. Start a
-   **new** conversation; `/archive-stop` can disable exporting B's own conversation
-   while still importing A's archive. Run `/archive-load`, select A's conversation
-   and checkpoint, and enter a **nonexistent** destination directory whose
+4. On B, independently install/load the package and clone/open the private
+   **archive repository**. Sign in with B's own account and repository access;
+   no archive configuration is required. Start a **new** conversation: the saved
+   conversations should appear automatically. Select A's conversation
+   and checkpoint, and enter a **nonexistent local restore directory** whose
    parent already exists, e.g. `C:\Imports\synthetic-report-1`.
+   `/archive-load` reopens the picker if you cancel or choose Start fresh.
+   `/archive-stop` can disable exporting B's own conversation while still
+   importing A's archive.
 5. Read `READ-ME-FIRST.txt`, `manifest.json` and `transcript.md`. Confirm the
    actual user request, tool arguments/MCP structured results when available,
    arithmetic decision and UI decision are present. Compare output hashes:
@@ -292,19 +319,17 @@ including binary/session files, unchanged-file/runtime exclusions, opt-out/reloa
 privacy changes, MCP results, concurrency and frozen retry recovery.
 No test uploads to GitHub or imports actual user history.
 
-An optional bounded real-runtime test creates an isolated `COPILOT_HOME`,
-loads this plugin, checks the unconfigured fail-closed warning, then configures
-a synthetic destination in a non-repository working directory. It verifies
-zero consent prompts and fail-closed privacy verification, including reload,
-without contacting that synthetic repo, exporting history or sending model
-prompts. Private automatic capture is tested with synthetic visibility responses
-and local Git remotes; the real private-GitHub/five-minute host check is manual.
+An optional bounded real-runtime test creates an isolated `COPILOT_HOME`, loads
+this plugin, and verifies that unverified/non-repository workspaces fail closed,
+with and without configuration. It then uses a copied plugin with the actual
+controller and SDK UI, but injected synthetic visibility and local bare Git
+storage. The real host receives one automatic conversation-picker elicitation,
+which the harness declines; resume/reload must not show it again. No archive
+configuration is supplied for this synthetic private session. This checks actual
+SDK picker wiring, not a human seeing the app dialog. No real GitHub archive is
+read or written, no model prompt is sent, and no active session is exported.
 The harness grants only this synthetic extension's hook registration.
-An optional third `OWNER/PRIVATE_REPO` argument also checks real private-repo
-startup against a local Git workspace containing only synthetic files. It reads
-only GitHub visibility metadata, verifies automatic activation without prompts,
-and stops before the five-minute timer; it never uploads. This startup check
-passed during validation; a real five-minute GitHub upload remains a manual check.
+A real private-GitHub/five-minute host check remains a manual integration check.
 
 ```powershell
 node test\runtime-smoke.mjs ABSOLUTE_SDK_DIRECTORY ABSOLUTE_CLI_NPM_LOADER

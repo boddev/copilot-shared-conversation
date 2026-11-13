@@ -249,7 +249,7 @@ export class ArchiveStore {
         return command("git", ["-c", "core.hooksPath=" + path.join(this.root, "no-hooks"), "-c", "commit.gpgsign=false",
             "-c", "core.autocrlf=false", "-c", "core.longpaths=true", "-c", "gc.auto=0", ...args], cwd);
     }
-    async checkout() {
+    async checkout({ readOnly = false } = {}) {
         await verifyDestination(this.config, this.localTest);
         const jobs = path.join(this.root, "jobs");
         await fs.mkdir(jobs, { recursive: true });
@@ -261,13 +261,19 @@ export class ArchiveStore {
             const { stdout } = await this.git(directory, ["ls-remote", "--heads", "origin", ref]);
             if (stdout.trim()) {
                 await this.git(directory, ["fetch", "--quiet", "origin", ref]);
-                const tree = await this.git(directory, ["ls-tree", "-r", "--name-only", "FETCH_HEAD"]);
-                for (const file of tree.stdout.trim().split("\n").filter(Boolean)) {
+                const tree = await this.git(directory, ["ls-tree", "-r", "--name-only", "-z", "FETCH_HEAD"]);
+                const files = tree.stdout.split("\0").filter(Boolean);
+                for (const file of files) {
+                    if (readOnly && file !== "conversations" && !file.startsWith("conversations/")) continue;
                     if ((file !== "README.md" && !/^conversations\/[a-f0-9]{64}\/(?:latest\.json|checkpoints\/[a-f0-9]{64}\/(?:manifest\.json|READ-ME-FIRST\.txt|history\.jsonl|transcript\.md|(?:blobs|artifacts)\/[A-Za-z0-9_.-]+))$/.test(file)) || file.includes("..")) {
                         throw new Error("Archive branch contains unexpected paths. Use a dedicated archive repository (an initial README.md is supported).");
                     }
                 }
-                await this.git(directory, ["checkout", "--quiet", "-b", "archive-work", "FETCH_HEAD"]);
+                if (readOnly) {
+                    if (files.some((file) => file.startsWith("conversations/"))) {
+                        await this.git(directory, ["checkout", "--quiet", "FETCH_HEAD", "--", "conversations"]);
+                    }
+                } else await this.git(directory, ["checkout", "--quiet", "-b", "archive-work", "FETCH_HEAD"]);
             } else await this.git(directory, ["checkout", "--quiet", "--orphan", "archive-work"]);
             return directory;
         } catch (error) {
@@ -327,7 +333,7 @@ export class ArchiveStore {
         throw lastError;
     }
     async list() {
-        const directory = await this.checkout();
+        const directory = await this.checkout({ readOnly: true });
         try {
             await assertNoLinks(directory);
             const conversations = path.join(directory, "conversations");
@@ -340,14 +346,19 @@ export class ArchiveStore {
                 const latest = await readJson(path.join(conversations, entry.name, "latest.json"));
                 if (!/^[a-f0-9]{64}$/.test(latest.checkpoint || "")) throw new Error("Invalid checkpoint pointer.");
                 const checkpoints = (await fs.readdir(path.join(conversations, entry.name, "checkpoints"))).filter((name) => /^[a-f0-9]{64}$/.test(name));
-                records.push({ session: entry.name, ...latest, checkpoints });
+                const capture = await readSnapshot(path.join(conversations, entry.name, "checkpoints", latest.checkpoint), latest.checkpoint);
+                const first = capture.files.get("history.jsonl").toString("utf8").split("\n").filter(Boolean)
+                    .map((line) => JSON.parse(line)).find((event) => event.type === "user.message");
+                const data = first?.dataRef ? JSON.parse(capture.files.get(first.dataRef.file).toString("utf8")) : first?.data;
+                const title = typeof data?.content === "string" ? redactText(data.content).replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 120) : undefined;
+                records.push({ session: entry.name, ...latest, checkpoints, title });
             }
             return records;
         } finally { await fs.rm(directory, { recursive: true, force: true }); }
     }
     async import(key, destination, selectedCheckpoint) {
         if (!/^[a-f0-9]{64}$/.test(key)) throw new Error("Select an exact session ID from archive list.");
-        const directory = await this.checkout();
+        const directory = await this.checkout({ readOnly: true });
         try {
             await assertNoLinks(directory);
             const sessionDir = path.join(directory, "conversations", key);

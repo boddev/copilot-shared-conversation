@@ -53,6 +53,7 @@ export async function scanOutputs(roots, stateRoot) {
                 if (++entries > MAX_ENTRIES) throw new Error(`Automatic output scan exceeded ${MAX_ENTRIES} entries. No partial baseline/capture will be used.`);
                 const file = path.join(directory, child.name);
                 const name = `${root.kind}/${path.relative(root.directory, file).split(path.sep).join("/")}`;
+                if (root.kind === "workspace" && directory === root.directory && child.name === "conversations") continue;
                 if (excluded.test(child.name) || isRestrictedPath(child.name) || file === stateRoot || inside(stateRoot, file)) continue;
                 const stat = await fs.lstat(file);
                 if (stat.isSymbolicLink()) { omissions.push({ artifact: name, reason: "Symlink/junction excluded from automatic outputs" }); continue; }

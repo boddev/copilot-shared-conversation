@@ -3,9 +3,9 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { atomicJson, command, readJson, redactText, sessionKey } from "../extensions/archive/core.mjs";
+import { ArchiveStore, atomicJson, command, readJson, redactText, sessionKey, snapshot } from "../extensions/archive/core.mjs";
 
-const [sdkDirectory, cliLoader, privateRepo] = process.argv.slice(2);
+const [sdkDirectory, cliLoader] = process.argv.slice(2);
 if (!sdkDirectory || !cliLoader) throw new Error("Usage: node test/runtime-smoke.mjs ABSOLUTE_SDK_DIRECTORY ABSOLUTE_CLI_NPM_LOADER");
 const { CopilotClient, RuntimeConnection } = await import(pathToFileURL(path.join(sdkDirectory, "index.js")));
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "archive-runtime-smoke-"));
@@ -43,11 +43,11 @@ try {
     const archive = await ready(session);
     let events = await session.getEvents();
     const warningDeadline = Date.now() + 5000;
-    while (!JSON.stringify(events).includes("Not configured") && Date.now() < warningDeadline) {
+    while (!JSON.stringify(events).includes("Startup failed closed") && Date.now() < warningDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 50));
         events = await session.getEvents();
     }
-    assert.ok(JSON.stringify(events).includes("Not configured"), "Expected fail-closed setup warning.");
+    assert.ok(JSON.stringify(events).includes("Startup failed closed"), "A non-repository workspace must fail closed even without configuration.");
     await assert.rejects(fs.access(path.join(root, "archive", "pending")));
     await session.disconnect();
 
@@ -80,37 +80,57 @@ try {
     await ready(session);
     assert.equal(requests.length, 0, "Resume/reload must not prompt.");
     await assert.rejects(fs.access(path.join(root, "archive", "pending")));
-    let privateSessionActivated = false;
-    if (privateRepo) {
-        if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(privateRepo)) throw new Error("Optional private repository must be owner/repo.");
-        await session.disconnect();
-        const workingDirectory = path.join(root, "synthetic-private-work");
-        await fs.mkdir(workingDirectory);
-        await command("git", ["init", "--quiet"], workingDirectory);
-        await command("git", ["remote", "add", "origin", `https://github.com/${privateRepo}.git`], workingDirectory);
-        await fs.writeFile(path.join(workingDirectory, "existing-synthetic.txt"), "Existing synthetic file must only be fingerprinted.");
-        await atomicJson(path.join(root, "archive", "config.json"), { version: 1,
-            destination: { repo: privateRepo, remote: `https://github.com/${privateRepo}.git` } });
-        session = await client.createSession({ ...options, workingDirectory });
-        await ready(session);
-        const statePath = path.join(root, "archive", "consent", `${sessionKey(session.sessionId)}.json`);
-        const deadline = Date.now() + 15000;
-        let state = await readJson(statePath, null);
-        while (!state && Date.now() < deadline) {
-            await new Promise((resolve) => setTimeout(resolve, 50));
-            state = await readJson(statePath, null);
-        }
-        assert.ok(state?.accepted && state.automatic, "Real runtime must automatically activate a new verified-private session.");
-        assert.equal(state.repository.toLowerCase(), privateRepo.toLowerCase());
-        assert.ok(Object.keys(state.baseline).some((file) => file.endsWith("existing-synthetic.txt")));
-        assert.equal(requests.length, 0);
-        await assert.rejects(fs.access(path.join(root, "archive", "pending")));
-        privateSessionActivated = true;
-    }
+    await session.disconnect();
+    await fs.unlink(path.join(root, "archive", "config.json"));
+    const workingDirectory = path.join(root, "synthetic-private-work");
+    await fs.mkdir(workingDirectory);
+    await fs.writeFile(path.join(workingDirectory, "existing-synthetic.txt"), "Existing synthetic file must only be fingerprinted.");
+    const remote = path.join(root, "synthetic.git");
+    await command("git", ["init", "--bare", "--quiet", remote]);
+    const config = { version: 1, destination: { remote, branch: "main", localTest: true } };
+    const storeRoot = path.join(root, "synthetic-store");
+    const store = new ArchiveStore(storeRoot, config, { localTest: true });
+    await store.publish(sessionKey("previous-synthetic"), await snapshot("previous-synthetic", [
+        { id: "synthetic-request", type: "user.message", data: { content: "Synthetic previous conversation for startup picker" } },
+    ], []));
+    const syntheticPlugin = path.join(root, "synthetic-picker-plugin");
+    await fs.mkdir(syntheticPlugin);
+    await fs.copyFile(path.join(plugin, "plugin.json"), path.join(syntheticPlugin, "plugin.json"));
+    await fs.cp(path.join(plugin, "extensions"), path.join(syntheticPlugin, "extensions"), { recursive: true });
+    // Keep the actual controller and SDK UI; replace only external visibility/storage dependencies.
+    await fs.writeFile(path.join(syntheticPlugin, "extensions", "archive", "extension.mjs"),
+        `import { joinSession } from "@github/copilot-sdk/extension";
+import { startExtension } from "./controller.mjs";
+import { ArchiveStore } from "./core.mjs";
+await startExtension(joinSession, {
+    resolveRepository: async () => (${JSON.stringify({ directory: workingDirectory, repo: "synthetic/private-work", private: true })}),
+    verifyDestination: async () => {},
+    store: new ArchiveStore(${JSON.stringify(storeRoot)}, ${JSON.stringify(config)}, { localTest: true }),
+});\n`);
+    const pickerOptions = { ...options, workingDirectory, pluginDirectories: [syntheticPlugin] };
+    session = await client.createSession(pickerOptions);
+    await ready(session);
+    const pickerDeadline = Date.now() + 15000;
+    while (!requests.length && Date.now() < pickerDeadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(requests.length, 1, "The real SDK host must request one automatic conversation selection.");
+    assert.match(JSON.stringify(requests[0]), /Synthetic previous conversation for startup picker/);
+    assert.match(JSON.stringify(requests[0]), /Start fresh/);
+    const privateState = await readJson(path.join(root, "archive", "consent", `${sessionKey(session.sessionId)}.json`));
+    assert.ok(privateState.accepted && privateState.automatic);
+    assert.equal(privateState.repository, "synthetic/private-work");
+    await assert.rejects(fs.access(path.join(root, "archive", "config.json")));
+    await assert.rejects(fs.access(path.join(root, "archive", "pending")));
+    const pickerId = session.sessionId;
+    await session.disconnect();
+    session = await client.resumeSession(pickerId, pickerOptions);
+    await session.rpc.extensions.reload();
+    await ready(session);
+    assert.equal(requests.length, 1, "Resume/reload must not show the picker again.");
     console.log(JSON.stringify({ sdk: sdkDirectory, runtimeVersion: events.find((e) => e.type === "session.start")?.data.copilotVersion,
-        pluginLoaded: true, extension: archive.name, status: archive.status, failClosedWithoutSetup: true,
-        automaticStartupConsentRequests: requests.length, unverifiedWorkspaceDisabled: true,
-        resumedWithoutPrompt: true, privateSessionActivated, modelPromptsSent: 0, uploads: 0 }));
+        pluginLoaded: true, extension: archive.name, status: archive.status, unverifiedWorkspaceDisabled: true,
+        automaticStartupConsentRequests: 0, automaticConversationPickerRequests: requests.length,
+        syntheticPickerDeclined: true, resumedWithoutRepeatedPicker: true, syntheticPrivateSessionActivated: true,
+        externalVisibilityAndStorage: "synthetic local fixtures", modelPromptsSent: 0, githubUploads: 0 }));
 } catch (error) {
     if (session) {
         console.error(redactText(JSON.stringify(await session.getEvents())));

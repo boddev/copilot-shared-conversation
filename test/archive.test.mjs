@@ -119,13 +119,41 @@ test("reconfiguration invalidates consent, requires a new human decision, and re
     assert.equal((await readJson(controller.statePath)).accepted, false);
 });
 
-test("startup without setup reports disabled and never asks or reads", async (t) => {
+test("startup without setup or a verified repository fails closed and never asks or reads", async (t) => {
     const root = await sandbox(t), mock = mockSession();
-    await new ArchiveController(mock.session, { root }).initialize("new");
+    await new ArchiveController(mock.session, { root, resolveRepository: async () => { throw new Error("No verified repository"); } }).initialize("new");
     assert.equal(mock.state.reads, 0);
     assert.equal(mock.state.confirms.length, 0);
-    assert.match(mock.state.logs[0].message, /Not configured/);
+    assert.match(mock.state.logs[0].message, /No verified repository/);
     await assert.rejects(fs.access(path.join(root, "consent")));
+});
+
+test("repository discovery reads only archive paths alongside ordinary source and rejects malformed archive paths", async (t) => {
+    const { root, remote, config } = await localRemote(t);
+    const store = new ArchiveStore(path.join(root, "store"), config, { localTest: true });
+    const capture = await snapshot("existing", fixtureEvents(), []);
+    const key = sessionKey("existing");
+    await store.publish(key, capture);
+    const working = path.join(root, "working");
+    await command("git", ["clone", "--quiet", "--branch", "archive", remote, working]);
+    await fs.writeFile(path.join(working, "source.js"), "Synthetic source, never imported.");
+    await fs.writeFile(path.join(working, ".gitattributes"), "conversations/** text eol=crlf\n");
+    await command("git", ["add", "--", "source.js", ".gitattributes"], working);
+    await command("git", ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@localhost", "commit", "--quiet", "-m", "Add unrelated source"], working);
+    await command("git", ["push", "--quiet", "origin", "archive"], working);
+    const records = await store.list();
+    assert.equal(records.length, 1);
+    assert.match(records[0].title, /Build a report/);
+    const imported = await store.import(key, path.join(root, "restored"));
+    assert.equal(hash(await fs.readFile(path.join(imported.directory, "history.jsonl"))), hash(capture.files.get("history.jsonl")));
+    await assert.rejects(fs.access(path.join(imported.directory, "source.js")));
+    await assert.rejects(fs.access(path.join(imported.directory, ".gitattributes")));
+    const invalid = "unexpected-\u00e9.txt";
+    await fs.writeFile(path.join(working, "conversations", invalid), "Malformed archive path, quoted by Git unless NUL-delimited");
+    await command("git", ["add", "--", `conversations/${invalid}`], working);
+    await command("git", ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@localhost", "commit", "--quiet", "-m", "Add malformed fixture"], working);
+    await command("git", ["push", "--quiet", "origin", "archive"], working);
+    await assert.rejects(store.list(), /unexpected paths/);
 });
 
 test("artifact exact-revision consent, redaction, binary fidelity, sensitive paths and symlinks", async (t) => {

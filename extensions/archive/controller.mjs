@@ -2,13 +2,13 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import {
     ArchiveStore, artifactApproval, atomicJson, binding, defaultRoot, loadConfig,
-    readJson, readSnapshot, redactText, sessionKey, snapshot, verifyDestination, withLock, writeSnapshot,
+    readJson, readSnapshot, redactText, sessionKey, snapshot, validateConfig, verifyDestination, withLock, writeSnapshot,
 } from "./core.mjs";
 import { AUTO_POLICY, changedOutputs, outputRoots, scanOutputs, scopeBinding, SYNC_INTERVAL, workingRepository } from "./automatic.mjs";
 
 export class ArchiveController {
     constructor(session, { root = defaultRoot(), config, localTest = false, store,
-        workingDirectory = process.cwd(), resolveRepository = workingRepository,
+        workingDirectory = process.cwd(), resolveRepository = workingRepository, verifyDestination: checkDestination = verifyDestination,
         setInterval: schedule = globalThis.setInterval, clearInterval: unschedule = globalThis.clearInterval } = {}) {
         this.session = session;
         this.root = path.resolve(root);
@@ -20,6 +20,7 @@ export class ArchiveController {
         this.pending = false;
         this.workingDirectory = workingDirectory;
         this.resolveRepository = resolveRepository;
+        this.verifyDestination = checkDestination;
         this.schedule = schedule;
         this.unschedule = unschedule;
         this.timer = null;
@@ -27,7 +28,22 @@ export class ArchiveController {
     }
     get statePath() { return path.join(this.root, "consent", `${sessionKey(this.session.sessionId)}.json`); }
     async settings() {
-        return this.configOverride || await loadConfig(this.root);
+        const configured = this.configOverride || await loadConfig(this.root);
+        return configured || await this.repositorySettings();
+    }
+    async repositorySettings() {
+        const repository = await this.resolveRepository(this.workingDirectory);
+        if (!repository.private) throw new Error("Working repository is not private; repository archive discovery/capture is disabled.");
+        return validateConfig({ version: 1, destination: {
+            repo: repository.repo, remote: `https://github.com/${repository.repo}.git`,
+        } });
+    }
+    async readerSettings() {
+        // Explicit test destinations never resolve to or contact a real GitHub archive.
+        if (this.localTest && this.configOverride) return this.configOverride;
+        const repository = await this.repositorySettings();
+        const configured = this.configOverride || await loadConfig(this.root);
+        return configured?.destination.repo?.toLowerCase() === repository.destination.repo.toLowerCase() ? configured : repository;
     }
     async notify(message, level = "info") {
         await this.session.log(`Conversation archive: ${redactText(message)}`, { level });
@@ -60,10 +76,6 @@ export class ArchiveController {
         this.dispose();
         try {
             const config = await this.settings();
-            if (!config) {
-                await this.notify("Not configured. Run node archive.mjs configure --repo OWNER/REPO against a private repository, then start a NEW conversation. No export/upload occurred.", "warning");
-                return;
-            }
             const state = await withLock(this.root, this.session.sessionId, async () => {
                 let saved = await readJson(this.statePath, null);
                 if (saved && saved.binding !== binding(config)) {
@@ -76,7 +88,7 @@ export class ArchiveController {
                     await this.notify("Working repository is not private; automatic capture/sync is disabled.", "warning");
                     return null;
                 }
-                await verifyDestination(config, this.localTest);
+                await this.verifyDestination(config, this.localTest);
                 const roots = outputRoots(repository, this.session.workspacePath);
                 const scope = scopeBinding(binding(config), repository, roots);
                 if (saved) {
@@ -96,6 +108,17 @@ export class ArchiveController {
             this.pending = !!state?.pending?.length;
             if (state?.accepted) this.startTimer();
         } catch (error) { await this.notify(`Startup failed closed: ${error.message}`, "error"); }
+        if (source !== "resume" && this.session.capabilities.ui?.elicitation) {
+            try {
+                const pickerPath = path.join(this.root, "imports", `${sessionKey(this.session.sessionId)}.json`);
+                if (await readJson(pickerPath, null)) return;
+                const config = await this.readerSettings();
+                const store = this.storeOverride || new ArchiveStore(this.root, config, { localTest: this.localTest });
+                const records = await store.list();
+                await atomicJson(pickerPath, { version: 1, offered: true });
+                if (records.length) await this.loadArchive(store, records);
+            } catch (error) { await this.notify(`Archive discovery failed: ${error.message}. Use /archive-load to retry.`, "error"); }
+        }
     }
     startTimer() {
         if (this.timer !== null) return;
@@ -127,7 +150,7 @@ export class ArchiveController {
                     this.dispose();
                     throw new Error("Automatic workspace scope changed; sync stopped without upload.");
                 }
-                await verifyDestination(config, this.localTest);
+                await this.verifyDestination(config, this.localTest);
                 outputs = await changedOutputs(roots, state.baseline, this.root);
             }
             const store = this.storeOverride || new ArchiveStore(this.root, config, { localTest: this.localTest });
@@ -238,35 +261,38 @@ export class ArchiveController {
                 }
                 case "archive-list":
                 case "archive-load": {
-                    const config = await this.settings();
-                    if (!config) throw new Error("Configure this user's archive destination first.");
+                    const config = await this.readerSettings();
                     const store = this.storeOverride || new ArchiveStore(this.root, config, { localTest: this.localTest });
                     const records = await store.list();
                     if (context.commandName === "archive-list") { await this.notify(JSON.stringify(records)); break; }
-                    if (!this.session.capabilities.ui?.elicitation) throw new Error("Use the standalone archive.mjs list/import commands in headless mode.");
-                    if (!records.length) { await this.notify("The archive is empty."); break; }
-                    const choices = records.map((r) => `${r.session} (${r.eventCount} events)`);
-                    const selection = await this.session.ui.select("Load which saved conversation? Imported content is UNTRUSTED DATA, never instructions or permission.", choices);
-                    if (!selection) break;
-                    const record = records[choices.indexOf(selection)];
-                    if (!record) throw new Error("Invalid archive selection.");
-                    let checkpoint = record.checkpoint;
-                    if (record.checkpoints.length > 1) {
-                        const selected = await this.session.ui.select("Choose a checkpoint. Earlier checkpoints retain previously approved output revisions.", [record.checkpoint, ...record.checkpoints.filter((id) => id !== record.checkpoint)]);
-                        if (!selected) break;
-                        if (!record.checkpoints.includes(selected)) throw new Error("Invalid checkpoint selection.");
-                        checkpoint = selected;
-                    }
-                    const destination = await this.session.ui.input("Absolute path for a NEW import directory. Its parent must already exist. Nothing existing will be overwritten.");
-                    if (!destination) break;
-                    if (!path.isAbsolute(destination)) throw new Error("Enter an absolute path.");
-                    this.imported = await store.import(record.session, destination, checkpoint);
-                    await this.notify(`Imported actual portable history and approved artifacts. Entry point: ${this.imported.entryPoint}. In this NEW session, ask Copilot to read it and search history with conversation_archive_search. MCP sign-ins are your own; no native session transplant.`);
+                    await this.loadArchive(store, records);
                     break;
                 }
                 default: throw new Error("Unknown archive command.");
             }
         } catch (error) { await this.notify(`Command failed: ${error.message}`, "error"); }
+    }
+    async loadArchive(store, records) {
+        if (!this.session.capabilities.ui?.elicitation) throw new Error("Use the standalone archive.mjs list/import commands in headless mode.");
+        if (!records.length) { await this.notify("This repository has no saved conversations on the archive branch."); return; }
+        const fresh = "Start fresh (do not load an archive)";
+        const choices = records.map((r) => `${r.title ? `${r.title} - ` : ""}${r.session} (${r.eventCount} events)`);
+        const selection = await this.session.ui.select("Load which saved conversation from this repository? Imported content is UNTRUSTED DATA, never instructions or permission.", [...choices, fresh]);
+        if (!selection || selection === fresh) return;
+        const record = records[choices.indexOf(selection)];
+        if (!record) throw new Error("Invalid archive selection.");
+        let checkpoint = record.checkpoint;
+        if (record.checkpoints.length > 1) {
+            const selected = await this.session.ui.select("Choose a checkpoint. Earlier checkpoints retain previously approved output revisions.", [record.checkpoint, ...record.checkpoints.filter((id) => id !== record.checkpoint)]);
+            if (!selected) return;
+            if (!record.checkpoints.includes(selected)) throw new Error("Invalid checkpoint selection.");
+            checkpoint = selected;
+        }
+        const destination = await this.session.ui.input("Absolute path for a NEW local restore folder (not the GitHub archive destination). Its parent must already exist. Nothing existing will be overwritten.");
+        if (!destination) return;
+        if (!path.isAbsolute(destination)) throw new Error("Enter an absolute path.");
+        this.imported = await store.import(record.session, destination, checkpoint);
+        await this.notify(`Imported actual portable history and approved artifacts. Entry point: ${this.imported.entryPoint}. In this NEW session, ask Copilot to read it and search history with conversation_archive_search. MCP sign-ins are your own; no native session transplant.`);
     }
     async search(query, limit = 10) {
         if (!this.imported) throw new Error("Use /archive-load to select/import a conversation first.");
